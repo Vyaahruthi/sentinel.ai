@@ -2,16 +2,16 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
+import plotly.graph_objects as go
 import datetime
 import io
-from streamlit_autorefresh import st_autorefresh
 
-# Page config
-st.set_page_config(page_title="Sentinel AI Monitoring", layout="wide", page_icon="👁️")
-st.title("Sentinel AI: Behaviour Monitoring & Explanations")
-
-# Auto-refresh every 4 seconds
-st_autorefresh(interval=4000, key="sentinel_refresh")
+# ── Page config — must be first Streamlit call ──────────────────────────────
+st.set_page_config(
+    page_title="Sentinel AI Monitoring",
+    layout="wide",
+    page_icon="👁️"
+)
 
 API_URL = "http://127.0.0.1:8000"
 
@@ -21,30 +21,139 @@ API_URL = "http://127.0.0.1:8000"
 
 SEVERITY_MAP = {
     "behaviour_adaptation": "High",
-    "data_bias": "Medium",
-    "data_drift": "High",
-    "feedback_loop": "High",
-    "silent_drift": "Medium",
-    "infrastructure_change": "Low",
-    "policy_change": "Medium",
+    "data_bias":            "Medium",
+    "data_drift":           "High",
+    "feedback_loop":        "High",
+    "silent_drift":         "Medium",
+    "infrastructure_change":"Low",
+    "policy_change":        "Medium",
     "technology_influence": "Medium",
-    "event_traffic": "Low",
+    "event_traffic":        "Low",
 }
 
 SEVERITY_COLORS = {
-    "High": "#ef4444",
+    "High":   "#ef4444",
     "Medium": "#f59e0b",
-    "Low": "#22c55e",
+    "Low":    "#22c55e",
 }
 
+METRIC_LABELS = {
+    "behaviour_adaptation": "Behaviour Adaptation (slope)",
+    "data_bias":            "Data Bias (gap)",
+    "data_drift":           "Data Drift (diff)",
+    "feedback_loop":        "Feedback Loop (corr)",
+    "silent_drift":         "Silent Drift (slope)",
+    "infrastructure_change":"Infrastructure Change (var)",
+    "policy_change":        "Policy Change (shift)",
+    "technology_influence": "Technology Influence (spikes)",
+    "event_traffic":        "Event Traffic (count)",
+}
+
+METRIC_KEYS = list(METRIC_LABELS.keys())
+
 # ---------------------------------------------------------------------------
-# Feature 2: Plain-English Translations for each metric
+# Safe API helpers — never crash the page
+# ---------------------------------------------------------------------------
+
+def safe_get(endpoint: str, timeout: int = 5) -> dict | None:
+    """GET from API. Returns parsed JSON or None on any failure."""
+    try:
+        r = requests.get(f"{API_URL}{endpoint}", timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def safe_post(endpoint: str, payload: dict, timeout: int = 5) -> dict | None:
+    """POST to API. Returns parsed JSON or None on any failure."""
+    try:
+        r = requests.post(f"{API_URL}{endpoint}", json=payload, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Flatten metrics — sentinel_engine returns {junction_id: {metric: val}}
+# We merge all junctions into one flat dict by averaging
+# ---------------------------------------------------------------------------
+
+def flatten_metrics(raw_metrics: dict) -> dict:
+    """
+    Accepts either:
+      - Flat dict:  {"behaviour_adaptation": 0.003, ...}
+      - Nested dict: {"J1": {"behaviour_adaptation": 0.003}, "J2": {...}}
+    Returns flat dict of metric_key -> float.
+    """
+    if not raw_metrics:
+        return {}
+
+    # Check if already flat (values are numbers not dicts)
+    first_val = next(iter(raw_metrics.values()), None)
+    if isinstance(first_val, (int, float)):
+        return raw_metrics
+
+    # Nested: average across junctions
+    merged = {}
+    counts = {}
+    for junction_data in raw_metrics.values():
+        if not isinstance(junction_data, dict):
+            continue
+        for k, v in junction_data.items():
+            if isinstance(v, (int, float)):
+                merged[k] = merged.get(k, 0.0) + v
+                counts[k] = counts.get(k, 0) + 1
+    return {k: merged[k] / counts[k] for k in merged}
+
+
+def flatten_z_scores(raw_z: dict) -> dict:
+    """Same flattening logic for z_scores nested by junction."""
+    if not raw_z:
+        return {}
+    first_val = next(iter(raw_z.values()), None)
+    if not isinstance(first_val, dict):
+        return raw_z
+    merged = {}
+    counts = {}
+    for jdata in raw_z.values():
+        if not isinstance(jdata, dict):
+            continue
+        for k, v in jdata.items():
+            if isinstance(v, (int, float)):
+                merged[k] = merged.get(k, 0.0) + v
+                counts[k] = counts.get(k, 0) + 1
+    return {k: merged[k] / counts[k] for k in merged}
+
+
+def flatten_baseline_mean(raw_mean: dict) -> dict:
+    """Same flattening logic for baseline_mean nested by junction."""
+    if not raw_mean:
+        return {}
+    first_val = next(iter(raw_mean.values()), None)
+    if not isinstance(first_val, dict):
+        return raw_mean
+    merged = {}
+    counts = {}
+    for jdata in raw_mean.values():
+        if not isinstance(jdata, dict):
+            continue
+        for k, v in jdata.items():
+            if isinstance(v, (int, float)):
+                merged[k] = merged.get(k, 0.0) + v
+                counts[k] = counts.get(k, 0) + 1
+    return {k: merged[k] / counts[k] for k in merged}
+
+
+# ---------------------------------------------------------------------------
+# Plain-English translation
 # ---------------------------------------------------------------------------
 
 def get_translation(key: str, value: float) -> str:
-    """Return a one-line plain-English interpretation of a metric value."""
     v = abs(value)
-
     translations = {
         "behaviour_adaptation": [
             (0.001, "Decision thresholds are stable. No adaptation detected."),
@@ -91,7 +200,6 @@ def get_translation(key: str, value: float) -> str:
             (float('inf'), "High event traffic. AI decisions may be skewed by event patterns."),
         ],
     }
-
     buckets = translations.get(key, [])
     for threshold, text in buckets:
         if v < threshold:
@@ -99,916 +207,848 @@ def get_translation(key: str, value: float) -> str:
     return "No interpretation available."
 
 
-TRANSLATION_STYLE = (
-    '<p style="color:#94a3b8; font-size:12px; margin-top:-10px; '
-    'margin-bottom:16px; line-height:1.4;">{text}</p>'
-)
+# ---------------------------------------------------------------------------
+# Metric card renderer
+# ---------------------------------------------------------------------------
 
-
-def render_metric_with_translation(
-        label: str, key: str, value: float,
-        z_score: float = None, mean: float = None,
-        is_stable: bool = True, learning: bool = False,
-        fmt: str = ".4f"
-    ):
-    """Render a st.metric followed by a muted translation line and Z-score."""
+def render_metric_card(
+    label: str, key: str, value: float,
+    z_score: float = None, mean: float = None,
+    is_stable: bool = True, learning: bool = False,
+    fmt: str = ".4f"
+):
     st.metric(label, f"{value:{fmt}}")
     translation = get_translation(key, value)
-    
+
     if learning or z_score is None:
         z_str = '<span style="color:#94a3b8;">Z-score: Calibrating...</span>'
     else:
         z_abs = abs(z_score)
         if z_abs < 2.0:
             z_str = f'<span style="color:#94a3b8;">Z-score: {z_score:+.2f} [Within normal range]</span>'
-        elif z_abs < 2.5:
-            z_str = f'<span style="color:#f59e0b;">Z-score: {z_score:+.2f} [Elevated]</span>'
+        elif z_abs < 2.3:
+            z_str = f'<span style="color:#f59e0b;">Z-score: {z_score:+.2f} [Elevated — Tier 1]</span>'
         elif z_abs < 3.0:
-            z_str = f'<span style="color:#f97316;">Z-score: {z_score:+.2f} [Significant anomaly]</span>'
+            z_str = f'<span style="color:#f97316;">Z-score: {z_score:+.2f} [Anomaly — Tier 2]</span>'
         else:
-            z_str = f'<span style="color:#ef4444; font-weight:bold;">Z-score: {z_score:+.2f} [Extreme anomaly! 🚨]</span>'
+            z_str = f'<span style="color:#ef4444; font-weight:bold;">Z-score: {z_score:+.2f} [Critical — Tier 3 SOS 🚨]</span>'
 
-    warning_icon = " <span title='Unstable baseline' style='color:#f59e0b;'>⚠️</span>" if not is_stable and not learning else ""
-    mean_str = f"Baseline mean: {mean:{fmt}}{warning_icon}" if mean is not None else "Baseline mean: Calibrating..."
-    
-    info_html = f"""
+    warning_icon = (
+        " <span title='Unstable baseline' style='color:#f59e0b;'>⚠️</span>"
+        if not is_stable and not learning else ""
+    )
+    mean_str = (
+        f"Baseline mean: {mean:{fmt}}{warning_icon}"
+        if mean is not None else "Baseline mean: Calibrating..."
+    )
+
+    st.markdown(f"""
     <div style="margin-top:-10px; margin-bottom:16px;">
         <div style="font-size:13px; font-family:monospace; margin-bottom:4px;">{z_str}</div>
         <div style="font-size:12px; color:#64748b; margin-bottom:4px;">{mean_str}</div>
         <div style="color:#94a3b8; font-size:12px; line-height:1.4;">{translation}</div>
     </div>
-    """
-    st.markdown(info_html, unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# 1. Independent Alert State (persists across Streamlit reruns)
+# Alert resolution helper
 # ---------------------------------------------------------------------------
-if "active_alerts" not in st.session_state:
-    st.session_state.active_alerts = {}
 
-if "resolved_types" not in st.session_state:
-    try:
-        res = requests.get(f"{API_URL}/resolutions", timeout=5)
-        if res.status_code == 200:
-            resolved_rows = res.json().get("resolved_alerts", [])
-            st.session_state.resolved_types = {
-                r["alert_type"] for r in resolved_rows
-                if r.get("alert_type") and r.get("status") in ("RESOLVED", "ACKNOWLEDGED", "FALSE_POSITIVE")
-            }
-        else:
-            st.session_state.resolved_types = set()
-    except Exception:
-        st.session_state.resolved_types = set()
-
-# Audit log pagination state
-if "audit_page" not in st.session_state:
-    st.session_state.audit_page = 0
-
-
-# ---------------------------------------------------------------------------
-# Helper: resolve / acknowledge an alert (the ONLY way to remove it)
-# ---------------------------------------------------------------------------
 def resolve_alert(alert_type: str, status: str, notes: str = ""):
-    """Remove an alert from the active state and persist the resolution."""
-    alert = st.session_state.active_alerts.pop(alert_type, None)
-    if alert is None:
-        return
+    safe_post("/resolve", {
+        "alert_type": alert_type,
+        "status":     status,
+        "notes":      notes,
+    })
     st.session_state.resolved_types.add(alert_type)
-    try:
-        requests.post(
-            f"{API_URL}/resolutions",
-            json={
-                "alert_text": alert["message"],
-                "alert_type": alert_type,
-                "status": status,
-                "operator_notes": notes,
-            },
-            timeout=5,
-        )
-    except Exception as e:
-        st.error(f"Error saving resolution: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Fetch live data
-# ---------------------------------------------------------------------------
-def get_sentinel_data():
-    try:
-        res = requests.get(f"{API_URL}/metrics", timeout=12)
-        logs_res = requests.get(f"{API_URL}/logs?limit=500", timeout=2)
-        
-        # Also fetch baseline status
-        try:
-            baseline_res = requests.get(f"{API_URL}/baseline-status", timeout=2).json()
-        except:
-            baseline_res = None
-            
-        return res.json(), logs_res.json().get("logs", []), baseline_res
-    except Exception as e:
-        st.error(f"Error fetching sentinel data: {e}")
-        return None, [], None
-
-
-@st.cache_data(ttl=120)
-def get_explanation(alerts_for_explain, metrics):
-    if not alerts_for_explain:
-        return {
-            "cause": "System operating normally",
-            "reasons": ["All drift metrics are within expected thresholds.", "No anomalous behaviour detected."],
-            "recommended_actions": ["Continue monitoring traffic flow."]
-        }
-    try:
-        res = requests.post(f"{API_URL}/explain", json={"alerts": alerts_for_explain, "metrics": metrics}, timeout=15)
-        return res.json()
-    except Exception as e:
-        return {"cause": f"Error interacting with API: {e}", "reasons": [], "recommended_actions": []}
-
-
-# ---------------------------------------------------------------------------
-# Feature 3: PDF Generation
-# ---------------------------------------------------------------------------
-def generate_audit_pdf(audit_rows: list, metrics: dict) -> bytes:
-    """Generate a PDF audit report and return it as bytes."""
-    from fpdf import FPDF
-
-    class SentinelPDF(FPDF):
-        def header(self):
-            self.set_font("Helvetica", "B", 20)
-            self.set_text_color(59, 130, 246)
-            self.cell(0, 10, "SENTINEL.AI", ln=True, align="C")
-            self.set_font("Helvetica", "", 12)
-            self.set_text_color(100, 100, 100)
-            self.cell(0, 8, "AI Behaviour Drift Audit Report", ln=True, align="C")
-            self.set_font("Helvetica", "", 9)
-            self.cell(0, 6, f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
-            self.cell(0, 6, "System: Traffic Lane Control AI", ln=True, align="C")
-            self.ln(6)
-
-        def footer(self):
-            self.set_y(-15)
-            self.set_font("Helvetica", "I", 8)
-            self.set_text_color(150, 150, 150)
-            self.cell(0, 10, f"Generated by SENTINEL.AI  |  Confidential  |  Page {self.page_no()}", align="C")
-
-    pdf = SentinelPDF(orientation="L", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.add_page()
-
-    # --- Summary Section ---
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.set_text_color(30, 30, 30)
-    pdf.cell(0, 10, "Summary", ln=True)
-
-    total = len(audit_rows)
-    ack_count = sum(1 for r in audit_rows if r.get("status") in ("ACKNOWLEDGED", "RESOLVED"))
-    resolved_count = sum(1 for r in audit_rows if r.get("status") == "RESOLVED")
-    escalated_count = sum(1 for r in audit_rows if r.get("status") == "ESCALATED")
-    fp_count = sum(1 for r in audit_rows if r.get("status") == "FALSE_POSITIVE")
-
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(60, 60, 60)
-    summary_lines = [
-        f"Total Alerts: {total}",
-        f"Acknowledged: {ack_count}",
-        f"Resolved: {resolved_count}",
-        f"Escalated: {escalated_count}",
-        f"False Positives: {fp_count}",
-    ]
-    for line in summary_lines:
-        pdf.cell(0, 6, line, ln=True)
-    pdf.ln(6)
-
-    # --- Table ---
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.set_text_color(30, 30, 30)
-    pdf.cell(0, 10, "Audit Log", ln=True)
-
-    headers = ["Alert ID", "Type", "Severity", "Description", "Created At", "Ack", "Resolved", "Notes", "Action"]
-    col_widths = [28, 28, 18, 65, 35, 12, 16, 45, 30]
-
-    # Header row
-    pdf.set_font("Helvetica", "B", 7)
-    pdf.set_fill_color(59, 130, 246)
-    pdf.set_text_color(255, 255, 255)
-    for i, h in enumerate(headers):
-        pdf.cell(col_widths[i], 7, h, border=1, fill=True, align="C")
-    pdf.ln()
-
-    # Data rows
-    pdf.set_font("Helvetica", "", 7)
-    pdf.set_text_color(30, 30, 30)
-    for row in audit_rows:
-        alert_id = str(row.get("id", ""))[:8]
-        a_type = row.get("alert_type", "-")
-        severity = SEVERITY_MAP.get(a_type, "Medium")
-        desc = (row.get("alert_text", "-") or "-")[:50]
-        created = (row.get("resolved_at", "-") or "-")[:19]
-        status = row.get("status", "")
-        ack = "Y" if status in ("ACKNOWLEDGED", "RESOLVED") else "N"
-        resolved = "Y" if status == "RESOLVED" else "N"
-        notes = (row.get("operator_notes", "") or "")[:35]
-        action = _derive_action(status)
-
-        cells = [alert_id, a_type, severity, desc, created, ack, resolved, notes, action]
-        for i, val in enumerate(cells):
-            safe_val = str(val).replace("—", "-").replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'").encode('latin-1', 'replace').decode('latin-1')
-            pdf.cell(col_widths[i], 6, safe_val, border=1, align="C")
-        pdf.ln()
-
-    buf = io.BytesIO()
-    pdf.output(buf)
-    return buf.getvalue()
+    if alert_type in st.session_state.active_alerts:
+        del st.session_state.active_alerts[alert_type]
 
 
 def _derive_action(status: str) -> str:
-    """Derive a human-readable action from the status field."""
     mapping = {
-        "RESOLVED": "Resolved",
-        "ACKNOWLEDGED": "Acknowledged",
-        "FALSE_POSITIVE": "Marked False Positive",
-        "ESCALATED": "Escalated to MLOps",
-        "MANUAL_OVERRIDE": "Manual Override",
+        "RESOLVED":      "Resolved",
+        "ACKNOWLEDGED":  "Acknowledged",
+        "FALSE_POSITIVE":"Marked False Positive",
+        "ESCALATED":     "Escalated to MLOps",
+        "OVERRIDDEN":    "Manual Override",
     }
     return mapping.get(status, "Pending")
 
 
 # ---------------------------------------------------------------------------
-# Main render
+# PDF generation — safe, no external dependency on jinja
 # ---------------------------------------------------------------------------
-data, logs, baseline_status = get_sentinel_data()
 
-if not data or "metrics" not in data or not data["metrics"]:
-    st.warning("Awaiting minimum data threshold (50 logs) for drift detection...")
-else:
-    metrics = data["metrics"]
-    new_alerts = data.get("alerts", [])
-    
-    baseline = data.get("baseline", {})
-    run_count = baseline.get("run_count", 0)
-    baseline_locked = baseline.get("locked", False)
-    baseline_mean = baseline.get("mean", {})
-    baseline_quality = baseline.get("quality", {})
-    z_scores = data.get("z_scores", {})
-    mode = data.get("mode", "active")
-    
-    import streamlit.components.v1 as components
-    if mode == "baseline_learning":
-        progress = min(100, int((run_count / 30) * 100))
-        color = "bg-amber-500" if progress < 100 else "bg-emerald-500"
-        title_text = f"Building baseline — {run_count}/30 evaluation runs complete." if progress < 100 else "Baseline locked. Sentinel is now actively monitoring."
-        components.html(f"""
-        <script src="https://cdn.tailwindcss.com"></script>
-        <div class="bg-slate-800 rounded-lg p-5 border border-slate-600 shadow-lg text-white font-sans mb-4">
-            <h3 class="text-xl font-bold mb-2 text-amber-400">{title_text}</h3>
-            <p class="text-slate-300 mb-4">Sentinel is learning what normal looks like for this system. No alerts will fire during this phase.</p>
-            <div class="w-full bg-slate-700 rounded-full h-4 overflow-hidden">
-                <div class="{color} h-4 rounded-full transition-all duration-500" style="width: {progress}%"></div>
-            </div>
-            <div class="text-right text-xs mt-1 text-slate-400">Progress: {progress}%</div>
-        </div>
-        """, height=170)
+def generate_audit_pdf(rows: list, metrics: dict) -> bytes:
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
 
-    # -------------------------------------------------------------------
-    # Persistent Trigger Logic — merge new alerts INTO session state
-    # -------------------------------------------------------------------
-    for alert_obj in new_alerts:
-        a_type = alert_obj["type"]
-        if a_type in st.session_state.active_alerts:
-            continue
-        if a_type in st.session_state.resolved_types:
-            continue
-        st.session_state.active_alerts[a_type] = {
-            **alert_obj,
-            "status": "Unacknowledged",
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=letter)
+        styles = getSampleStyleSheet()
+        elements = []
+
+        elements.append(Paragraph("SENTINEL.AI — Audit Report", styles["Title"]))
+        elements.append(Paragraph(
+            f"Generated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+            styles["Normal"]
+        ))
+        elements.append(Spacer(1, 12))
+
+        headers = ["Alert ID", "Type", "Severity", "Description", "Created", "Status"]
+        data = [headers]
+        for r in rows:
+            a_type = r.get("alert_type") or "—"
+            data.append([
+                str(r.get("id", ""))[:8],
+                a_type,
+                SEVERITY_MAP.get(a_type, "Medium"),
+                (r.get("alert_text") or "—")[:60],
+                (r.get("resolved_at") or "—")[:19],
+                r.get("status", "—"),
+            ])
+
+        t = Table(data, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+            ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE",    (0, 0), (-1, -1), 8),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+            ("GRID",        (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ]))
+        elements.append(t)
+        doc.build(elements)
+        return buf.getvalue()
+    except Exception:
+        # Fallback: return minimal text PDF bytes if reportlab not installed
+        return b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj 3 0 obj<</Type/Page/MediaBox[0 0 612 792]>>endobj\nxref\n0 4\n0000000000 65535 f\n0000000009 00000 n\n0000000058 00000 n\n0000000115 00000 n\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
+
+
+# ---------------------------------------------------------------------------
+# Session state initialisation — safe, never crashes
+# ---------------------------------------------------------------------------
+
+if "active_alerts" not in st.session_state:
+    st.session_state.active_alerts = {}
+
+if "resolved_types" not in st.session_state:
+    st.session_state.resolved_types = set()
+    data = safe_get("/resolutions")
+    if data:
+        st.session_state.resolved_types = {
+            r["alert_type"] for r in data.get("resolved_alerts", [])
+            if r.get("alert_type") and r.get("status") in (
+                "RESOLVED", "ACKNOWLEDGED", "FALSE_POSITIVE"
+            )
         }
 
-    active_alerts = list(st.session_state.active_alerts.values())
-    alert_messages = [a["message"] for a in active_alerts]
-    explanation = get_explanation(alert_messages, metrics)
+if "audit_page" not in st.session_state:
+    st.session_state.audit_page = 0
 
-    # -------------------------------------------------------------------
-    # Alerts Section
-    # -------------------------------------------------------------------
-    isAlertActive = len(active_alerts) > 0
+if "sim_results" not in st.session_state:
+    st.session_state.sim_results = None
 
-    if isAlertActive:
-        # Group alerts by Tier
-        tier_1 = [a for a in active_alerts if a.get('tier', 2) == 1]
-        tier_2 = [a for a in active_alerts if a.get('tier', 2) == 2]
-        tier_3 = [a for a in active_alerts if a.get('tier', 2) == 3]
-        
-        # Tier 3
-        if tier_3:
-            st.error(f"### 🆘 CRITICAL SOS INCIDENT: MANUAL OVERRIDE REQUIRED ({len(tier_3)} Active)")
-            for alert in tier_3:
-                st.markdown(f"**[{alert['type']}]** {alert['message']} (Z-score: {alert.get('z_score', 0):.2f})")
-                st.error(f"⚠️ **{alert.get('action', 'Human REQUIRED')}**")
-        
-        # Tier 2
-        if tier_2:
-            st.warning(f"### ⚠️ Pending Human Approval ({len(tier_2)} Active)")
-            for alert in tier_2:
-                st.markdown(f"**[{alert['type']}]** {alert['message']}")
-                st.info(f"**AI Correction Proposal:** {alert.get('correction_proposal', 'Review required.')}")
-        
-        # Tier 1 (Hidden in an expander)
-        if tier_1:
-            with st.expander(f"Tier 1 Auto-Acknowledged Logs ({len(tier_1)} items)"):
-                for alert in tier_1:
-                    st.caption(f"- **{alert['type']}**: {alert['message']}")
-                    st.caption(f"  *Action Taken*: {alert.get('action', 'Auto-acknowledged')}")
-    else:
-        if mode == "baseline_learning":
-            st.info("ℹ️ Baseline Calibrating - Alerting Suppressed")
-        elif new_alerts:
-            st.success("✅ System Operating Normally - All Alerts Resolved")
-        else:
-            st.success("✅ System Operating Normally - No Behavioural Drift Detected")
-    
-    st.markdown("---")
+# ---------------------------------------------------------------------------
+# Auto-refresh — after session state, before any rendering
+# ---------------------------------------------------------------------------
 
-    # -------------------------------------------------------------------
-    # Dual-State Gemini AI Explanation
-    # -------------------------------------------------------------------
-    st.markdown("### 🧠 Gemini AI Explanation")
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=5000, key="sentinel_refresh")
+except ImportError:
+    pass  # dashboard still works, just without auto-refresh
 
-    if not isAlertActive:
-        cause = "System operating within expected parameters. Recent decisions align perfectly with baseline historical data."
-        reasons = [
-            "All drift metrics are within expected thresholds.",
-            "No anomalous behaviour detected."
-        ]
-        actions = ["Continue standard monitoring. No intervention required."]
+# ===========================================================================
+# FETCH DATA — all in one place, all safe
+# ===========================================================================
 
-        colX, colY = st.columns([1, 1])
-        with colX:
-            st.success(f"**Root Cause:**\n\n{cause}")
-            st.info("**Reasons:**\n\n" + "\n".join([f"- {r}" for r in reasons]))
-        with colY:
-            st.info("**Recommended Operations Action:**\n\n" + "\n".join([f"- {a}" for a in actions]))
+sentinel_data = safe_get("/metrics") or {}
+logs_data     = safe_get("/logs") or {}
+logs          = logs_data.get("logs", []) if isinstance(logs_data, dict) else []
 
-        components.html("""
-        <script src="https://cdn.tailwindcss.com"></script>
-        <div class="bg-slate-800 rounded-lg p-5 mt-6 border border-emerald-700 shadow-lg">
-            <h3 class="text-emerald-400 text-xl font-semibold mb-5 text-center">✅ System Normal: Standard Actions</h3>
-            <div class="flex flex-row justify-center gap-4">
-                <button class="bg-transparent border border-slate-600 text-slate-300 hover:bg-slate-700 hover:text-white font-bold py-3 px-8 rounded-md transition-colors focus:outline-none" onclick="alert('Baseline Logged.')">
-                    📊 Log Current Baseline
-                </button>
-                <button class="bg-transparent border border-indigo-500 text-indigo-400 hover:bg-indigo-900 hover:text-indigo-200 font-bold py-3 px-8 rounded-md transition-colors focus:outline-none" onclick="alert('Health Check Initiated.')">
-                    🩺 Run Manual Health Check
-                </button>
-            </div>
-        </div>
-        """, height=180)
+# Parse sentinel response
+mode           = sentinel_data.get("mode", "unknown")
+status         = sentinel_data.get("status", "unknown")
+raw_metrics    = sentinel_data.get("metrics", {})
+raw_z_scores   = sentinel_data.get("z_scores", {})
+alerts_list    = sentinel_data.get("alerts", [])
+baseline_info  = sentinel_data.get("baseline", {})
+raw_mean       = baseline_info.get("mean", {})
 
-    else:
-        cause_text = explanation.get('cause', '') if explanation else ''
-        is_error = "Error" in cause_text or not (explanation and explanation.get('reasons'))
+metrics  = raw_metrics
+z_scores = raw_z_scores
+baseline_mean = raw_mean
 
-        if is_error:
-            cause = "The model is disproportionately weighting 'Event Traffic'. Recent telemetry shows a 34% spike in localized event traffic not present in baseline training data."
-            reasons = [
-                "34% spike in localized event traffic detected.",
-                "Baseline training data lacks representation of this event type.",
-                "Model over-indexed on the generic 'Event Traffic' feature."
-            ]
-            actions = [
-                "1. Temporarily override AI to manual lane control.",
-                "2. Flag data for MLOps review."
-            ]
-        else:
-            cause = explanation.get('cause', 'Unknown')
-            reasons = explanation.get('reasons', [])
-            actions = explanation.get('recommended_actions', [])
+learning = (mode == "baseline_learning")
+run_count = baseline_info.get("run_count", 0)
+learning_progress = baseline_info.get("learning_progress", 0)
+baseline_quality  = baseline_info.get("quality", {})
 
-        colX, colY = st.columns([1, 1])
-        with colX:
-            st.info(f"**Root Cause:**\n\n{cause}")
-            st.warning("**Reasons:**\n\n" + "\n".join([f"- {r}" for r in reasons]))
-        with colY:
-            st.success("**Recommended Operations Action:**\n\n" + "\n".join([f"- {a}" for a in actions]))
+# ===========================================================================
+# TITLE
+# ===========================================================================
 
-        components.html("""
-        <script src="https://cdn.tailwindcss.com"></script>
-        <div class="bg-slate-800 rounded-lg p-5 mt-6 border border-slate-700 shadow-lg">
-            <h3 class="text-white text-xl font-semibold mb-5 text-center">🧑‍💻 Human-in-the-Loop: Action Required</h3>
-            <div class="flex flex-row justify-between gap-4">
-                <button class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-md transition-colors shadow focus:ring-2 focus:ring-indigo-500 focus:outline-none" onclick="alert('Alert Acknowledged. Notifying team.')">
-                    ✓ Acknowledge Alert
-                </button>
-                <button class="flex-1 bg-transparent border-2 border-slate-500 text-slate-300 hover:bg-slate-700 hover:text-white font-bold py-3 px-4 rounded-md transition-colors focus:ring-2 focus:ring-slate-500 focus:outline-none" onclick="alert('Marked as False Positive. Tuning thresholds.')">
-                    ⊘ Mark as False Positive
-                </button>
-                <button class="flex-1 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 px-4 rounded-md transition-colors shadow focus:ring-2 focus:ring-amber-400 focus:outline-none" onclick="alert('Escalated to MLOps. Generating report.')">
-                    ! Escalate to MLOps
-                </button>
-                <button class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-4 rounded-md transition-colors shadow focus:ring-2 focus:ring-red-500 focus:outline-none" onclick="alert('CRITICAL: AI Overridden. Switched to Manual Lane Control!')">
-                    ⚠ Override AI / Manual Mode
-                </button>
-            </div>
-        </div>
-        """, height=180)
+st.title("👁️ Sentinel AI: Behaviour Monitoring & Explanations")
 
-        # ---------------------------------------------------------------
-        # Human Resolution — the ONLY way to dismiss an alert
-        # ---------------------------------------------------------------
-        st.markdown("---")
-        st.markdown("### 📋 Human‑in‑the‑Loop Alert Management")
-        
-        # Omit Tier 1 from human loop management
-        human_loop_alerts = [a for a in active_alerts if a.get("tier", 2) > 1]
-        
-        if not human_loop_alerts:
-            st.success("No pending alerts require human resolution.")
-            
-        for alert in human_loop_alerts:
-            a_type = alert["type"]
-            tier = alert.get("tier", 2)
-            
-            card_title = f"Manage Tier {tier} Alert: {alert['message']}"
-            with st.expander(card_title, expanded=True):
-                if tier == 3:
-                    st.markdown(f"**Alert Type:** `{a_type}` &nbsp;&nbsp;|&nbsp;&nbsp; **Severity:** `SOS CRITICAL` 🚨")
-                else:
-                    st.markdown(f"**Alert Type:** `{a_type}` &nbsp;&nbsp;|&nbsp;&nbsp; **Severity:** `Warning` ⚠️")
-                    
-                st.markdown(f"**Description:** {alert['message']}")
-                st.markdown(f"**First Detected:** `{alert['timestamp']}`")
-                st.markdown(f"**Status:** `{alert['status']}`")
-                
-                if tier == 2:
-                    st.info(f"**AI Proposal:** {alert.get('correction_proposal', 'Review required.')}")
+# ===========================================================================
+# API CONNECTION CHECK — shown only when API is unreachable
+# ===========================================================================
 
-                st.markdown("<br>", unsafe_allow_html=True)
-                op_col1, op_col2 = st.columns([1, 2])
+if not sentinel_data:
+    st.error(
+        "⚠️ Cannot reach the Sentinel API at `http://127.0.0.1:8000`. "
+        "Make sure your FastAPI backend is running (`uvicorn main:app --reload`) "
+        "and that the `/sentinel-status` endpoint exists."
+    )
+    st.info(
+        "The dashboard will auto-retry every 5 seconds. "
+        "Check your terminal for backend errors."
+    )
+    st.stop()
 
-                with op_col1:
-                    if tier == 2:
-                        if st.button("✓ Approve AI Proposal", key=f"ack_{a_type}"):
-                            resolve_alert(a_type, "ACKNOWLEDGED", "Operator approved AI correction proposal.")
-                            st.toast(f"Alert '{alert['message']}' acknowledged and AI proposal approved.")
-                            st.rerun()
+# ===========================================================================
+# BASELINE LEARNING BANNER
+# ===========================================================================
 
-                        if st.button("⊘ Reject AI Proposal", key=f"fp_{a_type}"):
-                            resolve_alert(a_type, "FALSE_POSITIVE", "Operator rejected AI proposal.")
-                            st.toast(f"Alert '{alert['message']}' AI proposal rejected.")
-                            st.rerun()
-                    elif tier == 3:
-                        if st.button("⚠ Resolve SOS", key=f"ack_{a_type}", type="primary"):
-                            resolve_alert(a_type, "MANUAL_OVERRIDE", "Operator manually resolved SOS.")
-                            st.toast(f"SOS Alert '{alert['message']}' resolved.")
-                            st.rerun()
-
-                with op_col2:
-                    notes_val = st.text_input(
-                        "Operator Notes",
-                        placeholder="Enter resolution notes here...",
-                        key=f"notes_{a_type}",
-                    )
-                    if st.button("Submit Resolution", key=f"sub_{a_type}"):
-                        resolve_alert(a_type, "RESOLVED", notes_val)
-                        st.toast(f"Alert '{alert['message']}' resolved.")
-                        st.rerun()
-
-    st.markdown("---")
-
-    # ===================================================================
-    # FEATURE 2: Drift Indicators with Plain-English Translations
-    # ===================================================================
-    st.header("Drift Indicators (9 Factors)")
-    
-    if mode == "active":
-        with st.expander(f"Baseline quality (based on {run_count} runs)", expanded=False):
-            html_rows = []
-            METRIC_KEYS = [
-                "behaviour_adaptation", "data_bias", "data_drift", "feedback_loop",
-                "silent_drift", "infrastructure_change", "policy_change",
-                "technology_influence", "event_traffic"
-            ]
-            for k in METRIC_KEYS:
-                q = baseline_quality.get(k, {})
-                stable = q.get("is_stable", False)
-                if stable:
-                    bar = "████████░░  stable"
-                    color = "#22c55e"
-                else:
-                    bar = "████░░░░░░  unstable (high variance)"
-                    color = "#ef4444"
-                html_rows.append(f"<div style='font-family:monospace; font-size:12px; margin-bottom:4px;'><span style='display:inline-block; width:180px;'>{k}</span><span style='color:{color};'>{bar}</span></div>")
-            st.markdown("".join(html_rows), unsafe_allow_html=True)
-            
-    mcol1, mcol2, mcol3 = st.columns(3)
-
-    is_learning = (mode == "baseline_learning")
-
-    with mcol1:
-        render_metric_with_translation(
-            "1. Behaviour Adaptation (slope)", "behaviour_adaptation", metrics.get("behaviour_adaptation", 0),
-            z_scores.get("behaviour_adaptation"), baseline_mean.get("behaviour_adaptation"),
-            baseline_quality.get("behaviour_adaptation", {}).get("is_stable", True), is_learning
-        )
-        render_metric_with_translation(
-            "4. Feedback Loop (corr)", "feedback_loop", metrics.get("feedback_loop", 0),
-            z_scores.get("feedback_loop"), baseline_mean.get("feedback_loop"),
-            baseline_quality.get("feedback_loop", {}).get("is_stable", True), is_learning
-        )
-        render_metric_with_translation(
-            "7. Policy Change (shift)", "policy_change", metrics.get("policy_change", 0),
-            z_scores.get("policy_change"), baseline_mean.get("policy_change"),
-            baseline_quality.get("policy_change", {}).get("is_stable", True), is_learning
-        )
-
-    with mcol2:
-        render_metric_with_translation(
-            "2. Data Bias (gap)", "data_bias", metrics.get("data_bias", 0),
-            z_scores.get("data_bias"), baseline_mean.get("data_bias"),
-            baseline_quality.get("data_bias", {}).get("is_stable", True), is_learning
-        )
-        render_metric_with_translation(
-            "5. Silent Drift (slope)", "silent_drift", metrics.get("silent_drift", 0),
-            z_scores.get("silent_drift"), baseline_mean.get("silent_drift"),
-            baseline_quality.get("silent_drift", {}).get("is_stable", True), is_learning
-        )
-        render_metric_with_translation(
-            "8. Technology Influence (spikes)", "technology_influence", metrics.get("technology_influence", 0),
-            z_scores.get("technology_influence"), baseline_mean.get("technology_influence"),
-            baseline_quality.get("technology_influence", {}).get("is_stable", True), is_learning, fmt=".0f"
-        )
-
-    with mcol3:
-        render_metric_with_translation(
-            "3. Data Drift (diff)", "data_drift", metrics.get("data_drift", 0),
-            z_scores.get("data_drift"), baseline_mean.get("data_drift"),
-            baseline_quality.get("data_drift", {}).get("is_stable", True), is_learning
-        )
-        render_metric_with_translation(
-            "6. Infrastructure Change (var)", "infrastructure_change", metrics.get("infrastructure_change", 0),
-            z_scores.get("infrastructure_change"), baseline_mean.get("infrastructure_change"),
-            baseline_quality.get("infrastructure_change", {}).get("is_stable", True), is_learning
-        )
-        render_metric_with_translation(
-            "9. Event Traffic (count)", "event_traffic", metrics.get("event_traffic", 0),
-            z_scores.get("event_traffic"), baseline_mean.get("event_traffic"),
-            baseline_quality.get("event_traffic", {}).get("is_stable", True), is_learning, fmt=".0f"
-        )
-        
-    # --- Baseline Threshold Status Card ---
-    if baseline_status:
-        st.markdown("---")
-        st.subheader("Dynamic Threshold Status")
-        
-        b_mode = baseline_status.get("mode", "learning")
-        samples = baseline_status.get("sample_size", 0)
-        req_samples = baseline_status.get("required_samples", 30)
-        prog = baseline_status.get("learning_progress_percent", 0)
-        
-        if b_mode == "learning":
-            mode_badge = f"<span style='background:#f59e0b; color:white; padding:4px 10px; border-radius:9999px; font-weight:bold; font-size:12px;'>Learning ({samples}/{req_samples})</span>"
-        else:
-            mode_badge = "<span style='background:#10b981; color:white; padding:4px 10px; border-radius:9999px; font-weight:bold; font-size:12px;'>Active — learned thresholds</span>"
-            
-        st.markdown(f"{mode_badge}", unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        if b_mode == "learning":
-            st.progress(prog / 100.0, text="Calibrating initial baseline thresholds...")
-        else:
-            b_col1, b_col2 = st.columns(2)
-            with b_col1:
-                st.markdown(f"**High congestion at: {baseline_status.get('high_threshold', 0):.2f}**")
-                st.caption(f"Learned from {samples} observations. Original: {baseline_status.get('original_high_threshold', 0):.2f}")
-                
-            with b_col2:
-                st.markdown(f"**Medium congestion at: {baseline_status.get('medium_threshold', 0):.2f}**")
-                st.caption(f"Learned from {samples} observations. Original: {baseline_status.get('original_medium_threshold', 0):.2f}")
-                
-            if baseline_status.get("threshold_floors_applied", False):
-                st.warning("Floor applied — baseline computed a lower threshold but safety minimum enforced")
-            if baseline_status.get("threshold_ceilings_applied", False):
-                st.warning("Ceiling applied — baseline computed a higher threshold but safety maximum enforced")
-
-    # ===================================================================
-    # FEATURE 4: Drift Injection / What-If Simulation
-    # ===================================================================
-    st.markdown("---")
-    st.header("🧪 Drift Injection / What-If Simulation")
-    st.markdown(
-        '<p style="color:#94a3b8; font-size:14px; margin-top:-10px;">'
-        'Adjust parameters to observe how Sentinel responds in real time</p>',
-        unsafe_allow_html=True,
+if learning:
+    st.warning(
+        f"🔄 **Building baseline — {run_count}/30 evaluation runs complete.** "
+        f"Sentinel is learning what normal looks like for this system. "
+        f"No alerts will fire during this phase."
+    )
+    st.progress(min(learning_progress / 100, 1.0))
+    st.info(
+        f"Progress: {learning_progress}% — Once 30 runs are complete, "
+        f"Z-score based alerting activates automatically."
     )
 
-    # --- Controls ---
-    sim_col1, sim_col2 = st.columns(2)
-    with sim_col1:
-        sim_traffic = st.slider(
-            "Traffic Volume", min_value=100, max_value=600,
-            value=298, step=10, key="sim_traffic",
-        )
-        sim_accident = st.toggle("Accident Active", value=False, key="sim_accident")
-    with sim_col2:
-        sim_lanes = st.slider(
-            "Active Lanes", min_value=1, max_value=6,
-            value=3, step=1, key="sim_lanes",
-        )
-        sim_event = st.toggle("Event Traffic Surge", value=False, key="sim_event")
+elif mode == "active":
+    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1.success("✅ Baseline locked — active monitoring")
+    col_s2.metric("Evaluation runs", run_count)
 
-    # Auto-run: detect any parameter change and auto-trigger simulation
-    _sim_params = (sim_traffic, sim_lanes, sim_accident, sim_event)
-    _prev_params = st.session_state.get("_prev_sim_params")
+    sos_active = any(a.get("tier") == 3 for a in alerts_list)
+    tier2_count = sum(1 for a in alerts_list if a.get("tier") == 2)
+    tier1_count = sum(1 for a in alerts_list if a.get("tier") == 1)
 
-    auto_triggered = False
-    if _prev_params is not None and _prev_params != _sim_params:
-        auto_triggered = True
-    st.session_state["_prev_sim_params"] = _sim_params
-
-    run_clicked = st.button("🚀 Run Simulation", type="primary", use_container_width=True, key="run_sim")
-
-    if auto_triggered:
-        st.caption("⏳ Recalculating…")
-
-    if run_clicked or auto_triggered:
-        with st.spinner("Running simulation…"):
-            try:
-                sim_res = requests.post(
-                    f"{API_URL}/simulate-drift",
-                    json={
-                        "traffic_volume": sim_traffic,
-                        "active_lanes": sim_lanes,
-                        "accident_active": sim_accident,
-                        "event_traffic_active": sim_event,
-                    },
-                    timeout=15,
-                )
-                sim_data = sim_res.json()
-            except Exception as e:
-                st.error(f"Simulation request failed: {e}")
-                sim_data = None
-
-        if sim_data and "error" not in sim_data:
-            st.session_state["sim_result"] = sim_data
-
-    # --- Render results if available ---
-    sim_data = st.session_state.get("sim_result")
-    if sim_data:
-        b_metrics = sim_data["baseline_metrics"]
-        s_metrics = sim_data["simulated_metrics"]
-        b_alerts = sim_data["baseline_alerts"]
-        s_alerts = sim_data["simulated_alerts"]
-        newly = sim_data["newly_triggered"]
-        resolved = sim_data.get("resolved_by_simulation", [])
-
-        # --- Summary banner ---
-        if newly:
-            alert_names = ", ".join([n.replace("_", " ").title() for n in newly])
-            st.error(f"🚨 Simulation triggered **{len(newly)}** new drift alert(s): **{alert_names}**")
-        else:
-            st.success("✅ No new drift detected under these conditions. System is stable.")
-
-        if resolved:
-            resolved_names = ", ".join([n.replace("_", " ").title() for n in resolved])
-            st.info(f"🔧 Simulation resolved {len(resolved)} alert(s): **{resolved_names}**")
-
-        # --- Split comparison ---
-        left, right = st.columns(2)
-
-        METRIC_LABELS = {
-            "behaviour_adaptation": "1. Behaviour Adaptation",
-            "data_bias": "2. Data Bias",
-            "data_drift": "3. Data Drift",
-            "feedback_loop": "4. Feedback Loop",
-            "silent_drift": "5. Silent Drift",
-            "infrastructure_change": "6. Infrastructure Change",
-            "policy_change": "7. Policy Change",
-            "technology_influence": "8. Technology Influence",
-            "event_traffic": "9. Event Traffic",
-        }
-
-        def _badge(text: str, color: str) -> str:
-            return (
-                f'<span style="background:{color}; color:white; padding:2px 8px; '
-                f'border-radius:9999px; font-size:11px; font-weight:600; '
-                f'margin-left:8px;">{text}</span>'
-            )
-
-        with left:
-            st.markdown("#### 📊 Baseline (last 500 real decisions)")
-            for key, label in METRIC_LABELS.items():
-                val = b_metrics.get(key, 0.0)
-                is_alert = key in b_alerts
-                badge = _badge("ALERT", "#ef4444") if is_alert else _badge("OK", "#22c55e")
-                fmt_val = f"{val:.4f}" if key not in ("technology_influence", "event_traffic") else f"{val:.0f}"
-                st.markdown(
-                    f'<p style="margin:4px 0; font-size:14px;">'
-                    f'<strong>{label}</strong>: {fmt_val} {badge}</p>',
-                    unsafe_allow_html=True,
-                )
-
-        with right:
-            st.markdown("#### 🧪 Simulated (with your parameters)")
-            for key, label in METRIC_LABELS.items():
-                val = s_metrics.get(key, 0.0)
-                b_val = b_metrics.get(key, 0.0)
-                is_new_alert = key in newly
-                is_alert = key in s_alerts
-                changed = abs(val - b_val) > 1e-6
-
-                if is_new_alert:
-                    badge = _badge("NEW ALERT", "#ef4444")
-                elif is_alert:
-                    badge = _badge("ALERT", "#ef4444")
-                else:
-                    badge = _badge("OK", "#22c55e")
-
-                highlight = ' style="color:#f59e0b;"' if changed and not is_new_alert else ""
-                fmt_val = f"{val:.4f}" if key not in ("technology_influence", "event_traffic") else f"{val:.0f}"
-
-                st.markdown(
-                    f'<p style="margin:4px 0; font-size:14px;">'
-                    f'<strong{highlight}>{label}</strong>: {fmt_val} {badge}</p>',
-                    unsafe_allow_html=True,
-                )
-
-        # --- Plain-English translations for changed metrics ---
-        changed_keys = [k for k in METRIC_LABELS if abs(s_metrics.get(k, 0) - b_metrics.get(k, 0)) > 1e-6]
-        if changed_keys:
-            st.markdown("---")
-            st.markdown("##### 💬 What changed (plain English)")
-            for key in changed_keys:
-                translation = get_translation(key, s_metrics.get(key, 0))
-                label = METRIC_LABELS[key]
-                st.markdown(
-                    f'<p style="color:#94a3b8; font-size:13px; margin:2px 0;">'
-                    f'<strong style="color:#e2e8f0;">{label}:</strong> {translation}</p>',
-                    unsafe_allow_html=True,
-                )
-
-    # Charts for visualization context
-    if logs:
-
-        st.markdown("---")
-        st.subheader("Contextual Analytics")
-        df = pd.DataFrame(logs)
-        df['event_time'] = pd.to_datetime(df['event_time'])
-
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_scatter = px.scatter(df, x='traffic', y='active_lanes', color='congestion_level',
-                                    title='AI Decision Mapping (Traffic vs Lanes)', template='plotly_dark')
-            st.plotly_chart(fig_scatter, use_container_width=True)
-
-        with c2:
-            event_counts = df['reason'].value_counts().reset_index()
-            event_counts.columns = ['Reason', 'Count']
-            fig_pie = px.pie(event_counts, values='Count', names='Reason',
-                             title='Event Distribution Triggering AI Behaviour', template='plotly_dark')
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-    # ===================================================================
-    # FEATURE 3: Audit Log
-    # ===================================================================
-    st.markdown("---")
-    st.header("📜 Audit Log")
-
-    # Fetch audit data
-    audit_rows = []
-    try:
-        audit_res = requests.get(f"{API_URL}/audit", timeout=5)
-        if audit_res.status_code == 200:
-            audit_rows = audit_res.json().get("audit_log", [])
-    except Exception as e:
-        st.error(f"Error fetching audit log: {e}")
-
-    if not audit_rows:
-        st.info("No audit records found yet. Resolved alerts will appear here.")
+    if sos_active:
+        col_s3.error("🚨 SOS — Human required")
+    elif tier2_count:
+        col_s3.warning(f"⚠️ {tier2_count} alert(s) awaiting human review")
     else:
-        # ---------------------------------------------------------------
-        # Filters
-        # ---------------------------------------------------------------
-        filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+        col_s3.success("✅ System operating normally")
 
-        all_types = sorted({r.get("alert_type", "—") or "—" for r in audit_rows})
-        with filter_col1:
-            sev_filter = st.selectbox("Filter by Severity", ["All", "High", "Medium", "Low"], key="sev_filter")
-        with filter_col2:
-            type_filter = st.selectbox("Filter by Alert Type", ["All"] + all_types, key="type_filter")
-        with filter_col3:
-            date_range = st.date_input(
-                "Date range",
-                value=[],
-                key="date_filter",
-            )
+# ===========================================================================
+# SECTION 1 — CRITICAL DRIFT ALERTS (always shown when alerts exist)
+# ===========================================================================
 
-        # Apply filters
-        filtered = audit_rows
-        if sev_filter != "All":
-            filtered = [r for r in filtered if SEVERITY_MAP.get(r.get("alert_type", ""), "Medium") == sev_filter]
-        if type_filter != "All":
-            filtered = [r for r in filtered if (r.get("alert_type") or "—") == type_filter]
-        if date_range and len(date_range) == 2:
-            start_d, end_d = date_range
-            filtered = [
-                r for r in filtered
-                if r.get("resolved_at") and start_d <= datetime.datetime.fromisoformat(r["resolved_at"][:10]).date() <= end_d
-            ]
+# Merge new backend alerts into session state
+for alert in alerts_list:
+    a_type = alert.get("type", "")
+    if a_type and a_type not in st.session_state.resolved_types:
+        st.session_state.active_alerts[a_type] = alert
 
-        # ---------------------------------------------------------------
-        # Pagination
-        # ---------------------------------------------------------------
-        PAGE_SIZE = 10
-        total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
-        if st.session_state.audit_page >= total_pages:
-            st.session_state.audit_page = total_pages - 1
+# SOS banner — tier 3
+sos_alerts = [a for a in st.session_state.active_alerts.values() if a.get("tier") == 3]
+if sos_alerts:
+    st.markdown("""
+    <div style="background:#7f1d1d; border:2px solid #ef4444; border-radius:8px;
+                padding:16px 20px; margin-bottom:16px; animation:pulse 1s infinite;">
+        <h3 style="color:#fca5a5; margin:0;">🚨 SOS — IMMEDIATE HUMAN INTERVENTION REQUIRED</h3>
+    </div>
+    <style>@keyframes pulse{0%,100%{border-color:#ef4444;}50%{border-color:#fca5a5;}}</style>
+    """, unsafe_allow_html=True)
 
-        start_idx = st.session_state.audit_page * PAGE_SIZE
-        page_rows = filtered[start_idx : start_idx + PAGE_SIZE]
+# Tier 3 → Tier 2 → Tier 1 alert cards
+for tier_level, tier_label, tier_color in [
+    (3, "Tier 3 — SOS", "#ef4444"),
+    (2, "Tier 2 — Awaiting Human Review", "#f59e0b"),
+    (1, "Tier 1 — Auto-resolved", "#22c55e"),
+]:
+    tier_alerts = [
+        a for a in st.session_state.active_alerts.values()
+        if a.get("tier") == tier_level
+        and a.get("type") not in st.session_state.resolved_types
+    ]
+    if not tier_alerts:
+        continue
 
-        # ---------------------------------------------------------------
-        # Render table as styled HTML
-        # ---------------------------------------------------------------
-        def build_badge(severity: str) -> str:
-            color = SEVERITY_COLORS.get(severity, "#94a3b8")
-            return (
-                f'<span style="background:{color}; color:white; padding:2px 8px; '
-                f'border-radius:9999px; font-size:11px; font-weight:600;">{severity}</span>'
-            )
+    st.markdown(f"### {tier_label}")
 
-        def build_check(val: bool) -> str:
-            return "✅" if val else '<span style="color:#94a3b8;">—</span>'
+    for alert in tier_alerts:
+        a_type = alert.get("type", "unknown")
+        z      = alert.get("z_score", 0.0)
+        val    = alert.get("current_value", 0.0)
+        b_m    = alert.get("baseline_mean", 0.0)
+        msg    = alert.get("message", "")
+        junc   = alert.get("junction", "")
 
-        table_html = """
-        <style>
-            .audit-table { width:100%; border-collapse:collapse; font-family:'Inter',sans-serif; font-size:13px; }
-            .audit-table th { background:#1e293b; color:#e2e8f0; padding:10px 8px; text-align:left; border-bottom:2px solid #334155; }
-            .audit-table td { padding:8px; border-bottom:1px solid #334155; color:#cbd5e1; }
-            .audit-table tr:hover td { background:#1e293b; }
-        </style>
-        <table class="audit-table">
-        <thead><tr>
-            <th>Alert ID</th><th>Alert Type</th><th>Severity</th><th>Description</th>
-            <th>Created At</th><th>Ack</th><th>Resolved</th><th>Operator Notes</th><th>Action Taken</th>
-        </tr></thead><tbody>
-        """
-
-        for row in page_rows:
-            alert_id = str(row.get("id", ""))[:8]
-            a_type = row.get("alert_type") or "—"
-            severity = SEVERITY_MAP.get(a_type, "Medium")
-            desc = row.get("alert_text") or "—"
-            created = (row.get("resolved_at") or "—")[:19]
-            status = row.get("status", "")
-            is_ack = status in ("ACKNOWLEDGED", "RESOLVED")
-            is_resolved = status == "RESOLVED"
-            notes = row.get("operator_notes") or ""
-            action = _derive_action(status)
-
-            table_html += f"""<tr>
-                <td><code>{alert_id}</code></td>
-                <td>{a_type}</td>
-                <td>{build_badge(severity)}</td>
-                <td>{desc}</td>
-                <td>{created}</td>
-                <td style="text-align:center;">{build_check(is_ack)}</td>
-                <td style="text-align:center;">{build_check(is_resolved)}</td>
-                <td>{notes}</td>
-                <td>{action}</td>
-            </tr>"""
-
-        table_html += "</tbody></table>"
-
-        st.markdown(table_html, unsafe_allow_html=True)
-
-        # ---------------------------------------------------------------
-        # Pagination controls
-        # ---------------------------------------------------------------
-        pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
-        with pcol1:
-            if st.button("← Previous", disabled=(st.session_state.audit_page == 0), key="prev_page"):
-                st.session_state.audit_page -= 1
-                st.rerun()
-        with pcol2:
+        with st.container():
             st.markdown(
-                f"<p style='text-align:center; color:#94a3b8;'>Page {st.session_state.audit_page + 1} of {total_pages} "
-                f"({len(filtered)} records)</p>",
-                unsafe_allow_html=True,
+                f'<div style="border-left:4px solid {tier_color}; '
+                f'padding:8px 16px; margin-bottom:8px; '
+                f'background:rgba(255,255,255,0.03); border-radius:4px;">'
+                f'<b style="color:{tier_color};">{METRIC_LABELS.get(a_type, a_type)}'
+                f'{"  [" + junc + "]" if junc else ""}</b><br>'
+                f'<small style="color:#94a3b8;">{msg}</small></div>',
+                unsafe_allow_html=True
             )
-        with pcol3:
-            if st.button("Next →", disabled=(st.session_state.audit_page >= total_pages - 1), key="next_page"):
-                st.session_state.audit_page += 1
-                st.rerun()
 
-        # ---------------------------------------------------------------
-        # PDF Export
-        # ---------------------------------------------------------------
-        st.markdown("<br>", unsafe_allow_html=True)
-        pdf_bytes = generate_audit_pdf(filtered, metrics)
-        filename = f"sentinel_audit_report_{datetime.datetime.now().strftime('%Y-%m-%d')}.pdf"
-        st.download_button(
-            label="📄 Export PDF Report",
-            data=pdf_bytes,
-            file_name=filename,
-            mime="application/pdf",
-            type="primary",
+            action_cols = st.columns(4)
+            btn_key = f"{a_type}_{tier_level}"
+
+            with action_cols[0]:
+                if st.button("✅ Acknowledge", key=f"ack_{btn_key}"):
+                    resolve_alert(a_type, "ACKNOWLEDGED", "Operator acknowledged.")
+                    st.rerun()
+            with action_cols[1]:
+                if st.button("🔍 False Positive", key=f"fp_{btn_key}"):
+                    resolve_alert(a_type, "FALSE_POSITIVE", "Marked as false positive.")
+                    st.rerun()
+            with action_cols[2]:
+                if st.button("📤 Escalate MLOps", key=f"esc_{btn_key}"):
+                    resolve_alert(a_type, "ESCALATED", "Escalated to MLOps.")
+                    st.rerun()
+            if tier_level == 3:
+                with action_cols[3]:
+                    if st.button("🛑 Override AI", key=f"ovr_{btn_key}"):
+                        resolve_alert(a_type, "OVERRIDDEN", "Manual override activated.")
+                        st.rerun()
+            elif tier_level == 2:
+                with action_cols[3]:
+                    with st.expander("✏️ Add notes & resolve"):
+                        notes_input = st.text_area("Operator notes", key=f"notes_{btn_key}")
+                        if st.button("Submit resolution", key=f"sub_{btn_key}"):
+                            resolve_alert(a_type, "RESOLVED", notes_input)
+                            st.rerun()
+
+st.markdown("---")
+
+# ===========================================================================
+# SECTION 2 — DRIFT INDICATORS (9 metrics)
+# ===========================================================================
+
+st.header("📊 Drift Indicators (9 Factors)")
+
+# Threshold mode badge
+if mode == "active":
+    st.markdown(
+        '<span style="background:#166534; color:#86efac; padding:4px 12px; '
+        'border-radius:20px; font-size:13px;">Dynamic thresholds — Z-score based</span>',
+        unsafe_allow_html=True
+    )
+elif learning:
+    st.markdown(
+        f'<span style="background:#713f12; color:#fde68a; padding:4px 12px; '
+        f'border-radius:20px; font-size:13px;">Static thresholds — building baseline '
+        f'({run_count}/30 runs)</span>',
+        unsafe_allow_html=True
+    )
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+if not metrics:
+    st.info("Waiting for metric data from the backend...")
+else:
+    row1 = st.columns(3)
+    row2 = st.columns(3)
+    row3 = st.columns(3)
+    col_groups = [row1, row2, row3]
+
+    for i, key in enumerate(METRIC_KEYS):
+        row_idx = i // 3
+        col_idx = i % 3
+        col = col_groups[row_idx][col_idx]
+
+        with col:
+            val   = metrics.get(key, 0.0)
+            z     = z_scores.get(key)
+            mean  = b_mean.get(key)
+            qual  = baseline_quality.get(key, {})
+            stable = qual.get("is_stable", True) if isinstance(qual, dict) else True
+
+            label = METRIC_LABELS.get(key, key)
+            fmt = ".0f" if key in ("technology_influence", "event_traffic") else ".4f"
+
+            render_metric_card(
+                label=label, key=key, value=val,
+                z_score=z, mean=mean,
+                is_stable=stable, learning=learning,
+                fmt=fmt
+            )
+
+st.markdown("---")
+
+# ===========================================================================
+# SECTION 3 — BASELINE vs CURRENT COMPARISON
+# ===========================================================================
+
+if mode == "active" and metrics and b_mean:
+    st.header("📈 Baseline vs Current Comparison")
+
+    comparison_data = []
+    for key in METRIC_KEYS:
+        current = metrics.get(key)
+        baseline = b_mean.get(key)
+        z = z_scores.get(key)
+        if current is None or baseline is None:
+            continue
+        comparison_data.append({
+            "Metric": METRIC_LABELS.get(key, key),
+            "Baseline mean": round(baseline, 4),
+            "Current value": round(current, 4),
+            "Z-score": round(z, 2) if z is not None else None,
+            "Status": (
+                "🔴 Critical" if z and abs(z) >= 3.0 else
+                "🟠 Anomaly"  if z and abs(z) >= 2.3 else
+                "🟡 Elevated" if z and abs(z) >= 2.0 else
+                "🟢 Normal"
+            )
+        })
+
+    if comparison_data:
+        cdf = pd.DataFrame(comparison_data)
+        st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+        # Visual comparison bar chart
+        fig = go.Figure()
+        labels = [d["Metric"] for d in comparison_data]
+        baselines = [d["Baseline mean"] for d in comparison_data]
+        currents  = [d["Current value"] for d in comparison_data]
+
+        fig.add_trace(go.Bar(
+            name="Baseline mean",
+            x=labels, y=baselines,
+            marker_color="#3b82f6", opacity=0.7
+        ))
+        fig.add_trace(go.Bar(
+            name="Current value",
+            x=labels, y=currents,
+            marker_color="#f59e0b", opacity=0.9
+        ))
+        fig.update_layout(
+            barmode="group",
+            title="Baseline vs Current — all 9 metrics",
+            template="plotly_dark",
+            height=400,
+            xaxis_tickangle=-30,
+            legend=dict(orientation="h", y=1.1)
         )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+# ===========================================================================
+# SECTION 4 — GEMINI AI EXPLANATION
+# ===========================================================================
+
+st.header("🧠 AI Explanation")
+
+explanation_data = safe_get("/explanation")
+if explanation_data:
+    exp = explanation_data.get("explanation", {})
+    if isinstance(exp, str):
+        st.write(exp)
+    elif isinstance(exp, dict):
+        col_exp1, col_exp2 = st.columns(2)
+        with col_exp1:
+            cause = exp.get("cause") or exp.get("root_cause", "")
+            if cause:
+                st.markdown(
+                    f'<div style="background:#14532d; border-radius:8px; padding:14px;">'
+                    f'<b style="color:#86efac;">Root Cause:</b><br>'
+                    f'<span style="color:#dcfce7;">{cause}</span></div>',
+                    unsafe_allow_html=True
+                )
+            reasons = exp.get("reasons", [])
+            if reasons:
+                st.markdown("**Reasons:**")
+                for r in reasons:
+                    st.markdown(f"- {r}")
+        with col_exp2:
+            actions = exp.get("recommended_actions", exp.get("actions", []))
+            if actions:
+                st.markdown(
+                    '<div style="background:#1e3a5f; border-radius:8px; padding:14px;">'
+                    '<b style="color:#93c5fd;">Recommended Actions:</b></div>',
+                    unsafe_allow_html=True
+                )
+                for i, a in enumerate(actions, 1):
+                    st.markdown(f"{i}. {a}")
+    else:
+        st.info("No AI explanation available. Ensure the /explanation endpoint is running.")
+else:
+    # Graceful fallback when no active alerts
+    active_count = len(st.session_state.active_alerts)
+    if active_count == 0:
+        st.success("✅ System Operating Normally — All Alerts Resolved")
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            st.markdown(
+                '<div style="background:#14532d; border-radius:8px; padding:14px;">'
+                '<b style="color:#86efac;">Root Cause:</b><br>'
+                '<span style="color:#dcfce7;">System operating within expected parameters. '
+                'Recent decisions align with baseline historical data.</span></div>',
+                unsafe_allow_html=True
+            )
+            st.markdown("**Reasons:**")
+            st.markdown("- All drift metrics are within expected thresholds.")
+            st.markdown("- No anomalous behaviour detected.")
+        with col_e2:
+            st.markdown(
+                '<div style="background:#1e3a5f; border-radius:8px; padding:14px;">'
+                '<b style="color:#93c5fd;">Recommended Operations Action:</b></div>',
+                unsafe_allow_html=True
+            )
+            st.markdown("1. Continue standard monitoring. No intervention required.")
+    else:
+        st.warning("AI explanation endpoint unreachable. Check `/explanation` route on your backend.")
+
+st.markdown("---")
+
+# ===========================================================================
+# SECTION 5 — HUMAN-IN-THE-LOOP ALERT MANAGEMENT
+# ===========================================================================
+
+st.header("📋 Human-in-the-Loop Alert Management")
+
+hitl_data = safe_get("/alerts")
+if hitl_data:
+    pending_alerts = hitl_data.get("alerts", [])
+    for alert in pending_alerts:
+        a_type = alert.get("alert_type", "")
+        if not a_type or a_type in st.session_state.resolved_types:
+            continue
+
+        severity = SEVERITY_MAP.get(a_type, "Medium")
+        sev_color = SEVERITY_COLORS.get(severity, "#94a3b8")
+
+        with st.expander(
+            f"Manage Alert: {alert.get('alert_text', a_type)}", expanded=True
+        ):
+            st.markdown(
+                f"**Alert Type:** "
+                f'<span style="color:{sev_color};">{a_type}</span> | '
+                f"**Severity:** "
+                f'<span style="color:{sev_color};">{severity}</span>',
+                unsafe_allow_html=True
+            )
+            desc = alert.get("alert_text", "")
+            if desc:
+                st.markdown(f"**Description:** {desc}")
+            created = alert.get("created_at", "")
+            if created:
+                st.markdown(
+                    f'**Created Time:** '
+                    f'<span style="color:#f59e0b;">{created[:19]}</span>',
+                    unsafe_allow_html=True
+                )
+
+            op_notes = st.text_area(
+                "Operator Notes", key=f"hitl_notes_{a_type}",
+                placeholder="Enter resolution notes here..."
+            )
+
+            hitl_cols = st.columns(4)
+            with hitl_cols[0]:
+                if st.checkbox("Acknowledge Alert", key=f"hitl_ack_{a_type}"):
+                    resolve_alert(a_type, "ACKNOWLEDGED", op_notes)
+                    st.rerun()
+            with hitl_cols[1]:
+                if st.checkbox("Mark Resolved",    key=f"hitl_res_{a_type}"):
+                    resolve_alert(a_type, "RESOLVED", op_notes)
+                    st.rerun()
+
+if not hitl_data or not hitl_data.get("alerts"):
+    st.info("No active alerts awaiting human review.")
+
+st.markdown("---")
+
+# ===========================================================================
+# SECTION 6 — WHAT-IF SIMULATION
+# ===========================================================================
+
+st.header("🧪 Drift Injection / What-If Simulation")
+st.caption("Adjust parameters to observe how Sentinel responds in real time")
+
+sim_col1, sim_col2 = st.columns(2)
+with sim_col1:
+    sim_traffic = st.slider("Traffic Volume", 100, 600, 298, step=10)
+    sim_accident = st.toggle("Accident Active", value=False)
+with sim_col2:
+    sim_lanes = st.slider("Active Lanes", 1, 6, 3, step=1)
+    sim_event  = st.toggle("Event Traffic Surge", value=False)
+
+if st.button("🚀 Run Simulation", type="primary", use_container_width=True):
+    sim_response = safe_post("/simulate-drift", {
+        "traffic_volume":       sim_traffic,
+        "active_lanes":         sim_lanes,
+        "accident_active":      sim_accident,
+        "event_traffic_active": sim_event,
+    })
+    st.session_state.sim_results = sim_response
+
+if st.session_state.sim_results:
+    sr = st.session_state.sim_results
+    newly  = sr.get("newly_triggered", [])
+    resolved_by_sim = sr.get("resolved_by_simulation", [])
+
+    if newly:
+        st.error(
+            f"🚨 Simulation triggered {len(newly)} new drift alert(s): "
+            + ", ".join(newly)
+        )
+    elif resolved_by_sim:
+        st.info(
+            f"🔧 Simulation resolved {len(resolved_by_sim)} alert(s): "
+            + ", ".join(resolved_by_sim)
+        )
+    else:
+        st.success("✅ No new drift detected under these conditions. System is stable.")
+
+    # Side-by-side comparison
+    b_sim = sr.get("baseline_metrics", {})
+    s_sim = sr.get("simulated_metrics", {})
+
+    if b_sim or s_sim:
+        st.subheader("Baseline vs Simulated — comparison")
+        sim_cmp_col1, sim_cmp_col2 = st.columns(2)
+
+        b_alerts_set = {a.get("type") for a in sr.get("baseline_alerts", [])}
+        s_alerts_set = {a.get("type") for a in sr.get("simulated_alerts", [])}
+
+        with sim_cmp_col1:
+            st.markdown("**📊 Baseline (last 500 real decisions)**")
+            for k in METRIC_KEYS:
+                bv = b_sim.get(k)
+                if bv is None:
+                    continue
+                badge = "🔴 ALERT" if k in b_alerts_set else "🟢 OK"
+                st.markdown(
+                    f"**{METRIC_LABELS.get(k, k)}:** `{bv:.4f}` {badge}"
+                )
+
+        with sim_cmp_col2:
+            st.markdown("**🧪 Simulated (with your parameters)**")
+            for k in METRIC_KEYS:
+                sv = s_sim.get(k)
+                if sv is None:
+                    continue
+                bv = b_sim.get(k, sv)
+                changed = abs(sv - bv) > 0.001
+                if k in newly:
+                    badge = "🔴 NEW ALERT"
+                    color = "#ef4444"
+                elif k in s_alerts_set:
+                    badge = "🔴 ALERT"
+                    color = "#f97316"
+                elif changed:
+                    badge = "🟡 CHANGED"
+                    color = "#f59e0b"
+                else:
+                    badge = "🟢 OK"
+                    color = "#22c55e"
+                st.markdown(
+                    f'**{METRIC_LABELS.get(k, k)}:** '
+                    f'`{sv:.4f}` '
+                    f'<span style="color:{color};">{badge}</span>',
+                    unsafe_allow_html=True
+                )
+
+        # What changed in plain English
+        if newly or resolved_by_sim:
+            st.subheader("💬 What changed (plain English)")
+            for i, k in enumerate(METRIC_KEYS, 1):
+                sv = s_sim.get(k)
+                if sv is None:
+                    continue
+                translation = get_translation(k, sv)
+                label = METRIC_LABELS.get(k, k)
+                st.markdown(f"**{i}. {label}:** {translation}")
+
+st.markdown("---")
+
+# ===========================================================================
+# SECTION 7 — CONTEXTUAL ANALYTICS CHARTS
+# ===========================================================================
+
+if logs:
+    st.subheader("📉 Contextual Analytics")
+    df_logs = pd.DataFrame(logs)
+    df_logs["timestamp"] = pd.to_datetime(
+        df_logs.get("timestamp", df_logs.get("event_time", pd.Series(dtype=str))),
+        errors="coerce"
+    )
+
+    if "traffic_volume" in df_logs.columns:
+        df_logs["traffic"] = df_logs["traffic_volume"]
+    elif "traffic" not in df_logs.columns:
+        df_logs["traffic"] = 100
+
+    if "active_lanes" not in df_logs.columns:
+        df_logs["active_lanes"] = df_logs["traffic"].apply(
+            lambda x: 3 if x > 200 else (2 if x > 100 else 1)
+        )
+
+    if "congestion_level" not in df_logs.columns:
+        df_logs["congestion_level"] = df_logs["traffic"] / (df_logs["active_lanes"] * 120)
+
+    if "reason" not in df_logs.columns:
+        df_logs["reason"] = df_logs.apply(
+            lambda row: (
+                "Simulated accident" if row.get("has_incident")
+                else "Peak hour rush" if row.get("is_peak_hour")
+                else "Normal flow"
+            ),
+            axis=1
+        )
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        fig_scatter = px.scatter(
+            df_logs, x="traffic", y="active_lanes", color="congestion_level",
+            title="AI Decision Mapping (Traffic vs Lanes)", template="plotly_dark"
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+    with chart_col2:
+        event_counts = df_logs["reason"].value_counts().reset_index()
+        event_counts.columns = ["Reason", "Count"]
+        fig_pie = px.pie(
+            event_counts, values="Count", names="Reason",
+            title="Event Distribution Triggering AI Behaviour",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.markdown("---")
+
+# ===========================================================================
+# SECTION 8 — AUDIT LOG
+# ===========================================================================
+
+st.header("📜 Audit Log")
+
+audit_data = safe_get("/audit")
+audit_rows = []
+if audit_data:
+    audit_rows = audit_data.get("audit_log", [])
+
+if not audit_rows:
+    st.info("No audit records found yet. Resolved alerts will appear here.")
+else:
+    # Filters
+    f1, f2, f3 = st.columns([1, 1, 2])
+    all_types = sorted({r.get("alert_type", "—") or "—" for r in audit_rows})
+
+    with f1:
+        sev_filter = st.selectbox("Filter by Severity", ["All", "High", "Medium", "Low"])
+    with f2:
+        type_filter = st.selectbox("Filter by Alert Type", ["All"] + all_types)
+    with f3:
+        date_range = st.date_input("Date range", value=[])
+
+    filtered = audit_rows
+    if sev_filter != "All":
+        filtered = [
+            r for r in filtered
+            if SEVERITY_MAP.get(r.get("alert_type", ""), "Medium") == sev_filter
+        ]
+    if type_filter != "All":
+        filtered = [r for r in filtered if (r.get("alert_type") or "—") == type_filter]
+    if date_range and len(date_range) == 2:
+        start_d, end_d = date_range
+        filtered = [
+            r for r in filtered
+            if r.get("resolved_at") and
+            start_d <= datetime.datetime.fromisoformat(r["resolved_at"][:10]).date() <= end_d
+        ]
+
+    # Pagination
+    PAGE_SIZE = 10
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    if st.session_state.audit_page >= total_pages:
+        st.session_state.audit_page = total_pages - 1
+
+    start_idx = st.session_state.audit_page * PAGE_SIZE
+    page_rows = filtered[start_idx: start_idx + PAGE_SIZE]
+
+    # Styled HTML table
+    def build_badge(severity: str) -> str:
+        color = SEVERITY_COLORS.get(severity, "#94a3b8")
+        return (
+            f'<span style="background:{color}; color:white; padding:2px 8px; '
+            f'border-radius:9999px; font-size:11px; font-weight:600;">{severity}</span>'
+        )
+
+    def build_check(val: bool) -> str:
+        return "✅" if val else '<span style="color:#94a3b8;">—</span>'
+
+    table_html = """
+    <style>
+    .audit-table{width:100%;border-collapse:collapse;font-family:'Inter',sans-serif;font-size:13px;}
+    .audit-table th{background:#1e293b;color:#e2e8f0;padding:10px 8px;text-align:left;border-bottom:2px solid #334155;}
+    .audit-table td{padding:8px;border-bottom:1px solid #334155;color:#cbd5e1;}
+    .audit-table tr:hover td{background:#1e293b;}
+    </style>
+    <table class="audit-table">
+    <thead><tr>
+    <th>Alert ID</th><th>Alert Type</th><th>Severity</th><th>Description</th>
+    <th>Created At</th><th>Ack</th><th>Resolved</th><th>Operator Notes</th><th>Action Taken</th>
+    </tr></thead><tbody>
+    """
+    for row in page_rows:
+        a_type   = row.get("alert_type") or "—"
+        severity = SEVERITY_MAP.get(a_type, "Medium")
+        r_status = row.get("status", "")
+        is_ack   = r_status in ("ACKNOWLEDGED", "RESOLVED")
+        is_res   = r_status == "RESOLVED"
+        table_html += (
+            f"<tr>"
+            f"<td><code>{str(row.get('id',''))[:8]}</code></td>"
+            f"<td>{a_type}</td>"
+            f"<td>{build_badge(severity)}</td>"
+            f"<td>{(row.get('alert_text') or '—')[:60]}</td>"
+            f"<td>{(row.get('resolved_at') or '—')[:19]}</td>"
+            f"<td style='text-align:center;'>{build_check(is_ack)}</td>"
+            f"<td style='text-align:center;'>{build_check(is_res)}</td>"
+            f"<td>{row.get('operator_notes') or ''}</td>"
+            f"<td>{_derive_action(r_status)}</td>"
+            f"</tr>"
+        )
+    table_html += "</tbody></table>"
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    # Pagination controls
+    pc1, pc2, pc3 = st.columns([1, 2, 1])
+    with pc1:
+        if st.button("← Previous", disabled=(st.session_state.audit_page == 0)):
+            st.session_state.audit_page -= 1
+            st.rerun()
+    with pc2:
+        st.markdown(
+            f"<p style='text-align:center; color:#94a3b8;'>Page "
+            f"{st.session_state.audit_page + 1} of {total_pages} "
+            f"({len(filtered)} records)</p>",
+            unsafe_allow_html=True
+        )
+    with pc3:
+        if st.button("Next →", disabled=(st.session_state.audit_page >= total_pages - 1)):
+            st.session_state.audit_page += 1
+            st.rerun()
+
+    # PDF Export
+    st.markdown("<br>", unsafe_allow_html=True)
+    pdf_bytes = generate_audit_pdf(filtered, metrics)
+    st.download_button(
+        label="📄 Export PDF Report",
+        data=pdf_bytes,
+        file_name=f"sentinel_audit_report_{datetime.datetime.now().strftime('%Y-%m-%d')}.pdf",
+        mime="application/pdf",
+        type="primary",
+    )

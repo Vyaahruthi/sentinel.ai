@@ -34,34 +34,24 @@ def read_root():
 
 @app.get("/baseline-status")
 def fetch_baseline_status():
-    """Returns the dynamic baseline learning status and thresholds."""
-    from backend.baseline_learner import collector, ThresholdLearner
-    learner = ThresholdLearner(collector)
-    stats = learner.get_thresholds()
+    """Returns the baseline learning status."""
+    from sentinel.baseline_engine import get_baseline_status, BASELINE_MIN_RUNS
+    state = get_baseline_status()
     
-    samples = stats['sample_size']
-    learning_progress = min(100, int((samples / 30) * 100))
-    
-    original_high = 0.8
-    original_medium = 0.6
-    shift_high = round(stats['high_threshold'] - original_high, 3)
-    shift_medium = round(stats['medium_threshold'] - original_medium, 3)
+    samples = state.get("run_count", 0)
+    learning_progress = state.get("learning_progress", 0)
     
     return {
-        "mode": stats['mode'],
+        "mode": state.get("mode", "learning"),
         "sample_size": samples,
-        "required_samples": 30,
+        "required_samples": BASELINE_MIN_RUNS,
         "learning_progress_percent": learning_progress,
-        "baseline_mean": round(stats['baseline_mean'], 3),
-        "baseline_std": round(stats['baseline_std'], 3),
-        "high_threshold": round(stats['high_threshold'], 3),
-        "medium_threshold": round(stats['medium_threshold'], 3),
-        "threshold_floors_applied": stats['threshold_floors_applied'],
-        "threshold_ceilings_applied": stats['threshold_ceilings_applied'],
-        "original_high_threshold": original_high,
-        "original_medium_threshold": original_medium,
-        "threshold_shift_high": f"{shift_high:+.3f}",
-        "threshold_shift_medium": f"{shift_medium:+.3f}"
+        "high_threshold": 0.8,
+        "medium_threshold": 0.6,
+        "threshold_floors_applied": False,
+        "threshold_ceilings_applied": False,
+        "original_high_threshold": 0.8,
+        "original_medium_threshold": 0.6,
     }
 
 @app.get("/logs")
@@ -124,12 +114,13 @@ class SimulateRequest(BaseModel):
     active_lanes: int = 3
     accident_active: bool = False
     event_traffic_active: bool = False
+    junction_id: str = "J1"
 
 
-def _evaluate_z_scores(metrics: dict, mean: dict, std: dict) -> list[str]:
+def _evaluate_z_scores(metrics: dict, mean: dict, std: dict, junction_id: str) -> list[str]:
     """Evaluate a metrics dict against Z-scores and return list of triggered alert type keys."""
     from sentinel.baseline_engine import compute_z_scores, ZSCORE_ALERT_THRESHOLD, METRIC_KEYS
-    z_scores = compute_z_scores(metrics, mean, std)
+    z_scores = compute_z_scores(metrics, mean, std, junction_id)
     triggered = []
     for key in METRIC_KEYS:
         z = z_scores.get(key)
@@ -153,6 +144,14 @@ def simulate_drift(request: SimulateRequest):
 
     baseline_df = pd.DataFrame(logs)
 
+    # Filter right away to the target junction
+    junction_id = request.junction_id
+    if 'junction_id' in baseline_df.columns:
+        baseline_df = baseline_df[baseline_df['junction_id'] == junction_id]
+
+    if baseline_df.empty:
+        return {"error": f"No baseline data available for junction {junction_id}."}
+
     # 2. Build 50 synthetic rows
     n = 50
     tv = request.traffic_volume
@@ -167,11 +166,9 @@ def simulate_drift(request: SimulateRequest):
     cong_raw = tv / (al * 120.0) + np.random.normal(0, 0.05, n)
     cong_vals = np.clip(cong_raw, 0, 5)
 
-    # Sample junction_type from the real distribution
-    jt_distribution = baseline_df['junction_type'].value_counts(normalize=True)
-    junction_types = np.random.choice(
-        jt_distribution.index, size=n, p=jt_distribution.values
-    )
+    junction_map = {"J1": "highway", "J2": "intersection", "J3": "roundabout"}
+    jt = junction_map.get(junction_id, "highway")
+    junction_types = [jt] * n
 
     incident_vals = [True] * n if request.accident_active else [False] * n
 
@@ -183,6 +180,7 @@ def simulate_drift(request: SimulateRequest):
         reason_vals = ["Simulation"] * n
 
     synthetic_df = pd.DataFrame({
+        "junction_id": [junction_id] * n,
         "event_time": timestamps,
         "traffic": traffic_vals,
         "congestion_index": cong_vals,
@@ -205,8 +203,8 @@ def simulate_drift(request: SimulateRequest):
     mean = state.get("baseline_mean", {})
     std = state.get("baseline_std", {})
 
-    baseline_alerts = _evaluate_z_scores(baseline_metrics, mean, std)
-    simulated_alerts = _evaluate_z_scores(simulated_metrics, mean, std)
+    baseline_alerts = _evaluate_z_scores(baseline_metrics, mean, std, junction_id)
+    simulated_alerts = _evaluate_z_scores(simulated_metrics, mean, std, junction_id)
 
     newly_triggered = [a for a in simulated_alerts if a not in baseline_alerts]
     resolved_by_simulation = [a for a in baseline_alerts if a not in simulated_alerts]

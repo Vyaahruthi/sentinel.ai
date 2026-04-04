@@ -60,4 +60,4 @@ CREATE TABLE IF NOT EXISTS traffic_baseline (
 );
 
 -- Add traffic_metrics column to logs table to support boiling frog Phase 1 & 2 logic
-ALTER TABLE logs ADD COLUMN IF NOT EXISTS traffic_metrics JSONB DEFAULT NULL;
+ALTER TABLE traffic_logs ADD COLUMN IF NOT EXISTS traffic_metrics JSONB DEFAULT NULL;

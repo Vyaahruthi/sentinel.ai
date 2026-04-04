@@ -30,7 +30,7 @@ supabase = get_db_client()
 def get_recent_logs(limit: int = 500):
     if not supabase: return []
     try:
-        response = supabase.table('traffic_logs').select('*').order('event_time', desc=True).limit(limit).execute()
+        response = supabase.table('traffic_logs').select('*').order('timestamp', desc=True).limit(limit).execute()
         return response.data if response.data else []
     except Exception as e:
         print(f"Error fetching logs: {e}")

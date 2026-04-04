@@ -1,142 +1,180 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
-from db import client
+from db import get_db_client
 import time
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="SENTINEL.AI Dashboard", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="Traffic AI Sentinel", layout="wide")
 
-st.title("🤖 SENTINEL.AI Monitoring System")
+# -------------------- DB INIT --------------------
+try:
+    client = get_db_client()
+except Exception as e:
+    st.error(f"Failed to initialize database client: {e}")
+    st.stop()
 
-# Sidebar
-st.sidebar.header("Sentinel Controls")
-mode = st.sidebar.radio("View", ["Live Monitor", "Timeline Replay"])
+st.title("🚦 Real-Time Traffic Control AI Sentinel")
+
+# -------------------- SIDEBAR --------------------
+st.sidebar.header("Controls")
+
+mode = st.sidebar.radio("View Mode", ["Live", "Historical"])
+
+if mode == "Historical":
+    date_range = st.sidebar.date_input("Date Range", [])
+else:
+    refresh_rate = st.sidebar.slider("Live Refresh Rate (seconds)", 2, 10, 5)
+    # AUTO REFRESH (CORRECT WAY)
+    if mode == "Live":
+       st_autorefresh(interval=refresh_rate * 1000, key="refresh")
+
 junctions = ["J1", "J2", "J3"]
-selected_junctions = st.sidebar.multiselect("Select Junctions", junctions, default=["J1"])
+selected_junctions = st.sidebar.multiselect("Junctions", junctions, default=junctions)
 
-def fetch_sentinel_data(limit=200):
-    if not selected_junctions:
-        return pd.DataFrame()
-    res = client.table("drift_events")\
-        .select("*")\
-        .in_("junction_id", selected_junctions)\
-        .order("detected_at", desc=True)\
-        .limit(limit * len(selected_junctions) * 9)\
-        .execute()
-    return pd.DataFrame(res.data)
+junction_map = {
+    "J1": "Highway",
+    "J2": "Intersection",
+    "J3": "Roundabout"
+}
 
-# ✅ FIXED
-def get_tier_color(tier):
-    if tier == 1:
+# -------------------- DATA FETCH --------------------
+@st.cache_data(ttl=1)
+def fetch_live_decisions(junctions_list):
+    data = []
+    for j in junctions_list:
+        res = client.table("decisions")\
+            .select("*")\
+            .eq("junction_id", j)\
+            .order("timestamp", desc=True)\
+            .limit(50)\
+            .execute()
+        data.extend(res.data)
+    return pd.DataFrame(data)
+
+# -------------------- HELPERS --------------------
+def get_color_for_status(z_score):
+    if z_score < 1:
         return "green"
-    elif tier == 2:
+    elif z_score < 2:
         return "orange"
     else:
         return "red"
 
-if mode == "Live Monitor":
-    st.subheader("Live Drift & Behaviour Parameters")
-    
-    df = fetch_sentinel_data(limit=10)
-    if not df.empty:
-        df["detected_at"] = pd.to_datetime(df["detected_at"])
-        df = df.sort_values("detected_at", ascending=False)
-        
+# -------------------- LIVE MODE --------------------
+if mode == "Live":
+
+    st.markdown("### Live Traffic Monitor")
+
+    df_live = fetch_live_decisions(selected_junctions)
+
+    if not df_live.empty:
+
+        cols = st.columns(len(selected_junctions))
+
+        for idx, j in enumerate(selected_junctions):
+            j_df = df_live[df_live["junction_id"] == j]
+
+            with cols[idx]:
+                st.subheader(f"Junction {j} ({junction_map.get(j)})")
+
+                if not j_df.empty:
+                    latest = j_df.iloc[0]
+
+                    z = latest["z_score"]
+                    color = get_color_for_status(z)
+
+                    # STATUS
+                    if z == 0:
+                        st.markdown("**Status:** 🟡 Learning baseline...")
+                    else:
+                        st.markdown(f"**Status:** :{color}[Z-Score {z:.2f}]")
+
+                    # METRICS
+                    c1, c2 = st.columns(2)
+                    c1.metric("Traffic", latest["original_traffic"])
+                    c2.metric("Lanes", latest["lanes_allocated"])
+
+                    # WHY PANEL
+                    with st.expander("Why this decision?"):
+                        st.write(f"Z-score: {z:.2f}")
+                        st.write(f"Traffic: {latest['original_traffic']}")
+                        st.write(f"Lanes: {latest['lanes_allocated']}")
+                        st.write(f"Reason: {latest['reason']}")
+
+                else:
+                    st.write("No data available.")
+
+        # ---------------- TABLE ----------------
+        st.markdown("### Last 50 Decisions")
+        df_live["timestamp"] = pd.to_datetime(df_live["timestamp"])
+        st.dataframe(
+            df_live.sort_values("timestamp", ascending=False),
+            use_container_width=True
+        )
+
+        # ---------------- GRAPHS ----------------
+        st.markdown("### Live Trends")
+
+        df_live = df_live.sort_values("timestamp")
+
         for j in selected_junctions:
-            st.markdown(f"### Junction: {j}")
-            j_df = df[df["junction_id"] == j]
+            j_df = df_live[df_live["junction_id"] == j]
+
             if not j_df.empty:
-                
-                latest_time = j_df["detected_at"].iloc[0]
-                latest_df = j_df[j_df["detected_at"] == latest_time]
-                
-                # ✅ FIXED (use z_score for drift strength)
-                combined_score = latest_df["z_score"].abs().mean()
-                dominant_tier = latest_df.sort_values(["z_score"], ascending=False).iloc[0]["tier"]
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Combined Drift Score", f"{combined_score:.3f}")
-                c2.markdown(f"**Dominant Tier (SOS Phase):** :{get_tier_color(dominant_tier)}[{dominant_tier}]")
-                c3.markdown(f"**Parameters Analysed:** {len(latest_df)}")
-                
-                st.markdown("#### The 9 Behavioral Parameters")
-                
-                cols = st.columns(3)
-                for idx, row in latest_df.reset_index(drop=True).iterrows():
-                    col_idx = idx % 3
-                    with cols[col_idx]:
-                        z_col = "red" if abs(row["z_score"]) > 2 else "orange" if abs(row["z_score"]) > 1 else "green"
-                        st.markdown(f"""
-                        <div style='padding: 10px; border-radius: 5px; border: 1px solid #333; margin-bottom: 10px;'>
-                            <b>{row['parameter']}</b><br/>
-                            Value: {row['current_value']:.2f} | Conf: {row['confidence']:.2f}<br/>
-                            Z-Score: <span style='color:{z_col}'>{row['z_score']:.2f}</span><br/>
-                            <i>{row['reason']}</i>
-                        </div>
-                        """, unsafe_allow_html=True)
-                
-                st.divider()
+                st.markdown(f"#### {j} Trends")
 
-        # ✅ FIXED GRAPH
-        st.subheader("Parameter Drift (Recent Graph)")
-        hist_df = fetch_sentinel_data(limit=50)
-        if not hist_df.empty:
-            hist_df["detected_at"] = pd.to_datetime(hist_df["detected_at"])
-            fig = px.line(
-                hist_df,
-                x="detected_at",
-                y="z_score",   # ✅ FIXED
-                color="parameter",
-                facet_row="junction_id",
-                title="Z-Score Fluctuations across Parameters"
-            )
-            fig.update_layout(height=600)
-            st.plotly_chart(fig, use_container_width=True)
+                fig = go.Figure()
 
-        st.button("Manual Refresh")
-        
-    else:
-        st.info("No data available yet. Ensure Sentinel-AI daemon is running.")
+                fig.add_trace(go.Scatter(
+                    x=j_df["timestamp"],
+                    y=j_df["original_traffic"],
+                    name="Traffic",
+                    line=dict(color="blue")
+                ))
 
-elif mode == "Timeline Replay":
-    st.subheader("Timeline Replay")
-    df = fetch_sentinel_data(limit=200)
-    
-    if not df.empty:
-        df["detected_at"] = pd.to_datetime(df["detected_at"])
-        df = df.sort_values("detected_at")
-        
-        timestamps = df["detected_at"].dt.strftime('%H:%M:%S').unique()
-        
-        if len(timestamps) > 0:
-            selected_t = st.select_slider("Replay Timestamp", options=timestamps, value=timestamps[-1])
-            st.markdown(f"**Viewing data for:** {selected_t}")
-            
-            replay_df = df[df["detected_at"].dt.strftime('%H:%M:%S') == selected_t]
-            
-            if not replay_df.empty:
-                st.dataframe(
-                    replay_df[["junction_id", "parameter", "current_value", "z_score", "confidence", "tier", "reason"]],
-                    use_container_width=True
+                fig.add_trace(go.Scatter(
+                    x=j_df["timestamp"],
+                    y=j_df["z_score"],
+                    name="Z-Score",
+                    yaxis="y2",
+                    line=dict(color="red")
+                ))
+
+                fig.add_trace(go.Bar(
+                    x=j_df["timestamp"],
+                    y=j_df["lanes_allocated"],
+                    name="Lanes",
+                    marker_color="green",
+                    opacity=0.3
+                ))
+
+                fig.update_layout(
+                    title=f"{j} Activity",
+                    yaxis=dict(title="Traffic"),
+                    yaxis2=dict(
+                        title="Z-Score",
+                        overlaying="y",
+                        side="right"
+                    ),
+                    hovermode="x unified"
                 )
-                
-                st.subheader("Combined Score Over Time")
 
-                # ✅ FIXED
-                combined_df = df.groupby(['detected_at', 'junction_id'])['z_score'].mean().reset_index()
-
-                fig = px.area(
-                    combined_df,
-                    x="detected_at",
-                    y="z_score",   # ✅ FIXED
-                    color="junction_id",
-                    title="Average Drift (Z-score) Across Parameters"
-                )
-                
-                target_dt = replay_df["detected_at"].iloc[0]
-                fig.add_vline(x=target_dt, line_width=2, line_dash="dash", line_color="red")
-                
                 st.plotly_chart(fig, use_container_width=True)
+
     else:
-        st.info("No historical data to replay.")
+        st.info("No live data available.")
+
+    # ---------------- CONTROLLED REFRESH ----------------
+    if "last_refresh" not in st.session_state:
+        st.session_state.last_refresh = time.time()
+
+    if time.time() - st.session_state.last_refresh > refresh_rate:
+        st.session_state.last_refresh = time.time()
+        st.rerun()
+
+# -------------------- HISTORICAL MODE --------------------
+elif mode == "Historical":
+
+    st.info("Select a date range to view historical data.")
+

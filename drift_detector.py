@@ -6,6 +6,10 @@ from baseline_engine import get_latest_baseline, compute_z_score, compute_confid
 
 TIER_THRESHOLDS = {1: 2.0, 2: 2.5, 3: 3.0}
 
+# Hysteresis: an active event only resolves once Z drops this far BELOW the T1 trigger.
+# Prevents instant resolve when Z briefly dips under the threshold.
+RESOLVE_HYSTERESIS_Z = 1.2
+
 PARAMETER_LABELS = {
     "behaviour_adaptation":  "Behaviour Adaptation",
     "data_bias":             "Data Bias",
@@ -40,6 +44,40 @@ def store_observation(client, junction_id: str, parameter: str,
         print(f"[detector] Obs store failed {parameter}: {e}")
 
 
+def get_active_event(client, junction_id: str, parameter: str) -> dict | None:
+    """Return the currently active drift event for this junction+parameter, or None."""
+    try:
+        res = (
+            client.table("drift_events")
+            .select("*")
+            .eq("junction_id", junction_id)
+            .eq("parameter",   parameter)
+            .eq("status",      "active")
+            .order("detected_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        print(f"[detector] get_active_event failed: {e}")
+        return None
+
+
+def update_drift_event(client, event_id: str,
+                        z_score: float, confidence: float,
+                        tier: int, current_value: float) -> None:
+    """Refresh z_score / tier on an already-active event (no new row created)."""
+    try:
+        client.table("drift_events").update({
+            "z_score":       round(z_score, 4),
+            "confidence":    confidence,
+            "tier":          tier,
+            "current_value": current_value,
+        }).eq("id", event_id).execute()
+    except Exception as e:
+        print(f"[detector] update_drift_event failed: {e}")
+
+
 def store_drift_event(client, junction_id: str, parameter: str,
                        current_value: float, baseline: dict,
                        z_score: float, confidence: float,
@@ -70,7 +108,14 @@ def store_drift_event(client, junction_id: str, parameter: str,
 def detect_drifts(client, junction_id: str, param_results: dict) -> list[dict]:
     """
     Full detection pass for all 9 parameters.
-    Returns list of drift event dicts (only tier >= 1 events).
+
+    Debouncing rules
+    ----------------
+    • If an active event already exists for this junction+parameter, we UPDATE
+      it in-place (z_score / tier / confidence) and return it — no new row.
+    • A new event is only inserted when there is no active event.
+    • Resolution (in sentinel_main) uses RESOLVE_HYSTERESIS_Z so a T3 event
+      won't close just because Z briefly dips from 3.1 to 2.9.
     """
     events = []
     for param, result in param_results.items():
@@ -88,12 +133,30 @@ def detect_drifts(client, junction_id: str, param_results: dict) -> list[dict]:
         confidence = compute_confidence(z)
         tier       = assign_tier(z)
 
+        # ── Check for an already-active event ───────────────────────────────
+        active = get_active_event(client, junction_id, param)
+
         if tier >= 1:
-            event = store_drift_event(
-                client, junction_id, param,
-                value, baseline, z, confidence, tier, reason
-            )
-            if event:
-                events.append(event)
+            if active:
+                # Drift is still ongoing — update the existing event in-place.
+                update_drift_event(client, active["id"], z, confidence, tier, value)
+                active.update({
+                    "z_score":       round(z, 4),
+                    "confidence":    confidence,
+                    "tier":          tier,
+                    "current_value": value,
+                    "parameter_label": PARAMETER_LABELS.get(param, param),
+                })
+                events.append(active)
+            else:
+                # New drift onset — create a fresh event.
+                event = store_drift_event(
+                    client, junction_id, param,
+                    value, baseline, z, confidence, tier, reason
+                )
+                if event:
+                    events.append(event)
+        # If tier == 0 and there is an active event, resolution is handled
+        # separately in sentinel_main via check_and_resolve (with hysteresis).
 
     return events

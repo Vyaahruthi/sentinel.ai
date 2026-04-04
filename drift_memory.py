@@ -58,13 +58,23 @@ def _resolve_event(client, event_id: str):
         print(f"[drift_memory] Resolve failed: {e}")
 
 
-def check_and_resolve(client, junction_id: str, parameter: str, current_tier: int):
+def check_and_resolve(client, junction_id: str, parameter: str,
+                       current_tier: int, current_z: float = 0.0):
     """
-    If current tier has dropped back to 0 but there is an active event,
-    record a resolution memory and close the event.
+    Close an active drift event only when the signal has truly calmed down.
+
+    Hysteresis rule
+    ---------------
+    Imports RESOLVE_HYSTERESIS_Z from drift_detector (default 1.2).
+    An event resolves only when |z| < RESOLVE_HYSTERESIS_Z, well below the
+    detection floor of 2.0.  This stops a T3 event closing the moment Z dips
+    from 3.1 to 2.9.
     """
-    if current_tier > 0:
-        return
+    from drift_detector import RESOLVE_HYSTERESIS_Z   # lazy import avoids circular dep
+
+    if abs(current_z) >= RESOLVE_HYSTERESIS_Z:
+        return   # Z still too high — keep the event open
+
     try:
         res = (
             client.table("drift_events")

@@ -1,23 +1,34 @@
 """
-Sentinel.AI Dashboard — full 6-tab monitoring interface.
+Sentinel.AI Dashboard — full 5-tab monitoring interface.
 Run: streamlit run sentinel_dashboard.py
 """
-import io
 import math
 import json
-import time
-import unicodedata
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 from datetime import datetime, timezone, timedelta
-from fpdf import FPDF
 
 from sentinel_db import get_client
 
+from streamlit_autorefresh import st_autorefresh
+
 st.set_page_config(page_title="Sentinel.AI", layout="wide", page_icon="🛡")
+# ✅ GLOBAL AUTO REFRESH (CORRECT WAY)
+if "refresh_rate" not in st.session_state:
+    st.session_state["refresh_rate"] = 5
+
+if "auto_refresh" not in st.session_state:
+    st.session_state["auto_refresh"] = True
+
+if st.session_state["auto_refresh"]:
+    st_autorefresh(
+        interval=st.session_state["refresh_rate"] * 1000,
+        key="global_refresh"
+    )
 client = get_client()
 
 JUNCTIONS = ["J1", "J2", "J3"]
@@ -56,9 +67,9 @@ def _conf(z: float) -> float:
 
 def _tier(z: float) -> int:
     az = abs(z)
-    if az >= 3.5: return 3
-    if az >= 2.5: return 2
-    if az >= 1.5: return 1
+    if az >= 5.0: return 3   # harder to reach T3
+    if az >= 3.5: return 2
+    if az >= 2.0: return 1
     return 0
 
 def _snap(raw) -> dict:
@@ -79,12 +90,16 @@ with st.sidebar:
         "Drift Timeline",
         "Combination Alerts",
         "Autonomy Panel",
-        "Audit Log",
     ])
     st.divider()
     jsel         = st.selectbox("Junction", JUNCTIONS)
     refresh_rate = st.slider("Refresh (sec)", 3, 30, 5)
     auto_refresh = st.checkbox("Auto-refresh", value=True)
+    
+
+    # store in session (IMPORTANT FIX)
+    st.session_state["refresh_rate"] = refresh_rate
+    st.session_state["auto_refresh"] = auto_refresh
     st.divider()
     st.caption(f"Last render: {datetime.now().strftime('%H:%M:%S')}")
 
@@ -151,201 +166,6 @@ def autonomy_history():
         return df
     except: return pd.DataFrame()
 
-def resolved_drift_events(jid=None, limit=500):
-    """Return drift_events with status 'resolved' or 'acknowledged'."""
-    try:
-        q = (client.table("drift_events")
-             .select("*")
-             .in_("status", ["resolved", "acknowledged"])
-             .order("detected_at", desc=True)
-             .limit(limit))
-        if jid:
-            q = q.eq("junction_id", jid)
-        df = pd.DataFrame(q.execute().data or [])
-        if not df.empty:
-            df["detected_at"] = pd.to_datetime(df["detected_at"])
-            if "resolved_at" in df.columns:
-                df["resolved_at"] = pd.to_datetime(df["resolved_at"])
-        return df
-    except:
-        return pd.DataFrame()
-
-def reviewed_autonomy_log(jid=None, limit=500):
-    """Return autonomy_log entries that are 'reviewed' (human acted on them)."""
-    try:
-        q = (client.table("autonomy_log")
-             .select("*")
-             .eq("status", "reviewed")
-             .order("reviewed_at", desc=True)
-             .limit(limit))
-        if jid:
-            q = q.eq("junction_id", jid)
-        df = pd.DataFrame(q.execute().data or [])
-        if not df.empty:
-            df["created_at"]  = pd.to_datetime(df["created_at"])
-            df["reviewed_at"] = pd.to_datetime(df["reviewed_at"])
-        return df
-    except:
-        return pd.DataFrame()
-
-# ─── PDF generator ────────────────────────────────────────────────────────────
-def _safe(text) -> str:
-    """Strip/replace characters that fpdf latin-1 can't encode."""
-    if text is None:
-        return ""
-    s = str(text)
-    # Normalise unicode to closest ASCII equivalent where possible
-    s = unicodedata.normalize("NFKD", s).encode("latin-1", errors="replace").decode("latin-1")
-    return s
-
-def generate_audit_pdf(
-    drift_df: pd.DataFrame,
-    autonomy_df: pd.DataFrame,
-    junction_filter: str,
-    tier_filter,
-    date_from,
-    date_to,
-    generated_by: str,
-) -> bytes:
-    """Build and return a PDF audit report as bytes."""
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    # ── Cover / header ─────────────────────────────────────────────────────
-    pdf.set_fill_color(30, 30, 50)
-    pdf.rect(0, 0, 210, 40, style="F")
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_xy(10, 10)
-    pdf.cell(0, 10, "SENTINEL.AI  -  Audit Log Report", ln=True)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_xy(10, 23)
-    pdf.cell(0, 6,
-        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}  "
-        f"| By: {_safe(generated_by) or 'System'}  "
-        f"| Junction: {junction_filter}  "
-        f"| Period: {date_from} to {date_to}",
-        ln=True,
-    )
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(15)
-
-    # ── Summary stats ──────────────────────────────────────────────────────
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Executive Summary", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_fill_color(240, 242, 250)
-
-    total_drift   = len(drift_df)
-    total_auto    = len(autonomy_df)
-    t1 = len(drift_df[drift_df["tier"] == 1]) if not drift_df.empty else 0
-    t2 = len(drift_df[drift_df["tier"] == 2]) if not drift_df.empty else 0
-    t3 = len(drift_df[drift_df["tier"] == 3]) if not drift_df.empty else 0
-
-    stats = [
-        ("Total alerts (resolved/acknowledged)", total_drift),
-        ("  - Tier 1 (AI auto-resolved)",        t1),
-        ("  - Tier 2 (Human review)",             t2),
-        ("  - Tier 3 (SOS)",                      t3),
-        ("Total autonomy decisions reviewed",     total_auto),
-    ]
-    for label, val in stats:
-        pdf.cell(130, 7, _safe(label), border=0, fill=True)
-        pdf.cell( 40, 7, str(val),      border=0, fill=True, align="R")
-        pdf.ln(7)
-    pdf.ln(5)
-
-    # ── Drift Event Details ────────────────────────────────────────────────
-    if not drift_df.empty:
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, f"Drift Events  ({len(drift_df)} records)", ln=True)
-        pdf.ln(2)
-
-        # Table header
-        col_widths = [28, 12, 36, 14, 14, 14, 22, 30, 26]
-        headers    = ["Detected At", "Jxn", "Parameter", "Z-score", "Conf%",
-                      "Tier", "Status", "Reason", "Resolved At"]
-        pdf.set_fill_color(50, 60, 100)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 7)
-        for w, h in zip(col_widths, headers):
-            pdf.cell(w, 8, h, border=1, fill=True, align="C")
-        pdf.ln()
-        pdf.set_text_color(0, 0, 0)
-
-        for idx, (_, row) in enumerate(drift_df.iterrows()):
-            fill = idx % 2 == 0
-            pdf.set_fill_color(245, 246, 252) if fill else pdf.set_fill_color(255, 255, 255)
-            pdf.set_font("Helvetica", "", 7)
-            det_at = str(row.get("detected_at", ""))[:19]
-            res_at = str(row.get("resolved_at", ""))[:19] if pd.notna(row.get("resolved_at")) else "—"
-            param  = PARAM_LABELS.get(row.get("parameter", ""), row.get("parameter", ""))
-            vals   = [
-                _safe(det_at),
-                _safe(row.get("junction_id", "")),
-                _safe(param),
-                _safe(f"{row.get('z_score', 0):.2f}"),
-                _safe(f"{row.get('confidence', 0):.1f}"),
-                _safe(str(row.get("tier", ""))),
-                _safe(row.get("status", "")),
-                _safe(str(row.get("reason", ""))[:38]),
-                _safe(res_at),
-            ]
-            for w, v in zip(col_widths, vals):
-                pdf.cell(w, 7, v, border=1, fill=fill, align="L")
-            pdf.ln()
-        pdf.ln(6)
-
-    # ── Autonomy / Human Decision Log ──────────────────────────────────────
-    if not autonomy_df.empty:
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, f"Autonomy Decision Log  ({len(autonomy_df)} records)", ln=True)
-        pdf.ln(2)
-
-        # Table header
-        col_widths2 = [28, 12, 10, 36, 14, 30, 26, 26, 28]
-        headers2    = ["Created At", "Jxn", "Tier", "AI Decision", "AI Conf%",
-                       "Human Decision", "Reviewer", "Reviewed At", "Notes"]
-        pdf.set_fill_color(50, 100, 60)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 7)
-        for w, h in zip(col_widths2, headers2):
-            pdf.cell(w, 8, h, border=1, fill=True, align="C")
-        pdf.ln()
-        pdf.set_text_color(0, 0, 0)
-
-        for idx, (_, row) in enumerate(autonomy_df.iterrows()):
-            fill = idx % 2 == 0
-            pdf.set_fill_color(245, 252, 246) if fill else pdf.set_fill_color(255, 255, 255)
-            pdf.set_font("Helvetica", "", 7)
-            rev_at = str(row.get("reviewed_at", ""))[:19] if pd.notna(row.get("reviewed_at")) else "—"
-            vals2  = [
-                _safe(str(row.get("created_at", ""))[:19]),
-                _safe(row.get("junction_id", "")),
-                _safe(str(row.get("tier", ""))),
-                _safe(str(row.get("ai_decision", ""))[:38]),
-                _safe(f"{row.get('ai_confidence', 0) or 0:.1f}"),
-                _safe(str(row.get("human_decision", ""))[:28]),
-                _safe(str(row.get("human_reviewer", ""))[:22]),
-                _safe(rev_at),
-                _safe(str(row.get("notes", ""))[:26]),
-            ]
-            for w, v in zip(col_widths2, vals2):
-                pdf.cell(w, 7, v, border=1, fill=fill, align="L")
-            pdf.ln()
-        pdf.ln(6)
-
-    # ── Footer ─────────────────────────────────────────────────────────────
-    pdf.set_font("Helvetica", "I", 8)
-    pdf.set_text_color(120, 120, 120)
-    pdf.cell(0, 6,
-        "SENTINEL.AI Audit Report  -  Confidential  -  For authorised personnel only",
-        align="C", ln=True,
-    )
-
-    return bytes(pdf.output())
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OVERVIEW
@@ -358,7 +178,20 @@ if view == "Overview":
     for i, jid in enumerate(JUNCTIONS):
         de    = drift_events(jid, limit=50)
         active = de[de["status"]=="active"] if not de.empty else pd.DataFrame()
-        mtier  = int(active["tier"].max()) if not active.empty else 0
+        if not active.empty:
+           t3_count = (active["tier"] == 3).sum()
+           t2_count = (active["tier"] == 2).sum()
+
+           if t3_count >= 3:
+              mtier = 3   # only if MANY T3 → SOS
+           elif t2_count >= 2:
+              mtier = 2
+           elif len(active) > 0:
+              mtier = 1
+           else:
+              mtier = 0
+        else:
+           mtier = 0
         tc     = TIER_COLORS[mtier]
         with cols[i]:
             st.markdown(f"### {jid}")
@@ -386,7 +219,7 @@ if view == "Overview":
             b = bl[bl["parameter"]==r["parameter"]]
             if b.empty: continue
             mean = b.iloc[0]["mean"]
-            std  = max(b.iloc[0]["std"], 1e-9)
+            std = max(b.iloc[0]["std"], 0.1)
             z    = (r["value"] - mean) / std
             rows.append({"Junction": jid,
                          "Parameter": PARAM_LABELS.get(r["parameter"], r["parameter"]),
@@ -412,9 +245,7 @@ if view == "Overview":
     else:
         st.info("No drift events yet.")
 
-    if auto_refresh:
-        time.sleep(refresh_rate)
-        st.rerun()
+    
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -442,7 +273,7 @@ elif view == "Parameter Drilldown":
                     f"Needs ~20 observations.")
         else:
             mean = row.iloc[0]["mean"]
-            std  = max(row.iloc[0]["std"], 1e-9)
+            std = max(row.iloc[0]["std"], 0.1)
             cv   = float(po.iloc[0]["value"])
             z    = (cv - mean) / std
             conf = _conf(z)
@@ -548,10 +379,7 @@ elif view == "Parameter Drilldown":
                 ctx_df = pd.DataFrame([{"Key": k, "Value": v} for k,v in ctx.items()])
                 st.dataframe(ctx_df, use_container_width=True, hide_index=True)
 
-    if auto_refresh:
-        time.sleep(refresh_rate)
-        st.rerun()
-
+    
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DRIFT TIMELINE REPLAY
@@ -613,27 +441,7 @@ elif view == "Drift Timeline":
                                height=260, margin=dict(l=40,r=40,t=40,b=20))
             st.plotly_chart(fig2, use_container_width=True)
 
-        # Step-through replay
-        st.subheader("Step-through replay")
-        if len(tl) > 0:
-            idx  = st.slider("Memory entry", 0, max(len(tl)-1,0), 0)
-            entry = tl.iloc[idx]
-            snap  = _snap(entry.get("snapshot"))
-
-            c1,c2,c3,c4 = st.columns(4)
-            c1.metric("Parameter",   PARAM_LABELS.get(entry.get("parameter",""),
-                                                       entry.get("parameter","")))
-            c2.metric("Memory type", str(entry.get("memory_type","")).upper())
-            c3.metric("Z-score",     str(snap.get("z_score","—")))
-            c4.metric("Confidence",  f"{snap.get('confidence','—')}%")
-
-            tier_v = snap.get("tier", 0)
-            tc     = TIER_COLORS.get(tier_v, "green")
-            st.markdown(f"**Tier at this moment:** :{tc}[{TIER_ICONS.get(tier_v,'?')} {TIER_LABELS.get(tier_v,'—')}]")
-            st.markdown(f"**Current value:** {snap.get('current_value','—')}")
-            st.markdown(f"**Baseline mean:** {snap.get('baseline_mean','—')}")
-            st.markdown(f"**Reason:** {snap.get('reason','—')}")
-            st.caption(f"Recorded at: {str(entry.get('recorded_at',''))[:19]}")
+       
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -698,9 +506,7 @@ elif view == "Combination Alerts":
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
-    if auto_refresh:
-        time.sleep(refresh_rate)
-        st.rerun()
+    
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -793,183 +599,4 @@ elif view == "Autonomy Panel":
             ] if c in ah.columns]
             st.dataframe(ah[show_cols], use_container_width=True, height=400)
 
-    if auto_refresh:
-        time.sleep(refresh_rate)
-        st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AUDIT LOG
-# ═══════════════════════════════════════════════════════════════════════════════
-elif view == "Audit Log":
-    st.title("📋 Audit Log — Resolved & Acknowledged Alerts")
-    st.caption(
-        "This view lists every drift event that has been resolved or acknowledged, "
-        "and every autonomy decision that has received a human review. "
-        "Use the filters below, then click **Download PDF** to export a signed audit report."
-    )
-
-    # ── Filters ───────────────────────────────────────────────────────────────
-    st.subheader("Filters")
-    fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 2])
-    with fc1:
-        audit_junc = st.selectbox("Junction", ["All"] + JUNCTIONS, key="audit_junc")
-    with fc2:
-        audit_tiers = st.multiselect(
-            "Tier", [1, 2, 3],
-            default=[1, 2, 3],
-            format_func=lambda t: TIER_LABELS.get(t, str(t)),
-            key="audit_tiers",
-        )
-    with fc3:
-        audit_date_from = st.date_input(
-            "From date",
-            value=(datetime.now() - timedelta(days=30)).date(),
-            key="audit_date_from",
-        )
-    with fc4:
-        audit_date_to = st.date_input(
-            "To date",
-            value=datetime.now().date(),
-            key="audit_date_to",
-        )
-
-    generated_by = st.text_input(
-        "Report generated by (name / ID)",
-        placeholder="e.g. Prashant V.",
-        key="audit_gen_by",
-    )
-
-    # ── Fetch data ────────────────────────────────────────────────────────────
-    _junc_filter = None if audit_junc == "All" else audit_junc
-    raw_drift    = resolved_drift_events(jid=_junc_filter)
-    raw_auto     = reviewed_autonomy_log(jid=_junc_filter)
-
-    # Date filtering
-    if not raw_drift.empty:
-        raw_drift = raw_drift[
-            (raw_drift["detected_at"].dt.date >= audit_date_from) &
-            (raw_drift["detected_at"].dt.date <= audit_date_to)
-        ]
-    if not raw_auto.empty:
-        raw_auto = raw_auto[
-            (raw_auto["created_at"].dt.date >= audit_date_from) &
-            (raw_auto["created_at"].dt.date <= audit_date_to)
-        ]
-
-    # Tier filtering
-    if audit_tiers and not raw_drift.empty:
-        raw_drift = raw_drift[raw_drift["tier"].isin(audit_tiers)]
-
-    # ── Summary metrics ───────────────────────────────────────────────────────
-    st.divider()
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Resolved / Ack. alerts", len(raw_drift))
-    m2.metric("Tier 1 resolved",  len(raw_drift[raw_drift["tier"] == 1]) if not raw_drift.empty else 0)
-    m3.metric("Tier 2 resolved",  len(raw_drift[raw_drift["tier"] == 2]) if not raw_drift.empty else 0)
-    m4.metric("Tier 3 resolved",  len(raw_drift[raw_drift["tier"] == 3]) if not raw_drift.empty else 0)
-    m5.metric("Human reviews logged", len(raw_auto))
-
-    st.divider()
-
-    # ── Drift Events Table ────────────────────────────────────────────────────
-    st.subheader(f"🔵 Resolved / Acknowledged Drift Events  ({len(raw_drift)})")
-    if raw_drift.empty:
-        st.info("No resolved or acknowledged drift events match the selected filters.")
-    else:
-        disp_drift = raw_drift.copy()
-        disp_drift["Parameter"] = disp_drift["parameter"].map(
-            lambda x: PARAM_LABELS.get(x, x)
-        )
-        disp_drift["Tier"] = disp_drift["tier"].map(
-            lambda t: f"{TIER_ICONS.get(t, '')} {TIER_LABELS.get(t, t)}"
-        )
-        show_cols_drift = [c for c in [
-            "detected_at", "junction_id", "Parameter",
-            "z_score", "confidence", "Tier", "status",
-            "reason", "resolved_at",
-        ] if c in disp_drift.columns or c in ["Parameter", "Tier"]]
-        st.dataframe(
-            disp_drift[show_cols_drift].rename(columns={
-                "detected_at":  "Detected At",
-                "junction_id":  "Junction",
-                "z_score":      "Z-score",
-                "confidence":   "Confidence %",
-                "status":       "Status",
-                "reason":       "Reason",
-                "resolved_at":  "Resolved At",
-            }),
-            use_container_width=True,
-            height=320,
-        )
-
-    st.divider()
-
-    # ── Autonomy Log Table ────────────────────────────────────────────────────
-    st.subheader(f"🟢 Human-Reviewed Autonomy Decisions  ({len(raw_auto)})")
-    if raw_auto.empty:
-        st.info("No reviewed autonomy decisions match the selected filters.")
-    else:
-        show_cols_auto = [c for c in [
-            "created_at", "junction_id", "tier",
-            "ai_decision", "ai_confidence",
-            "human_decision", "human_reviewer",
-            "reviewed_at", "notes",
-        ] if c in raw_auto.columns]
-        st.dataframe(
-            raw_auto[show_cols_auto].rename(columns={
-                "created_at":      "Created At",
-                "junction_id":     "Junction",
-                "tier":            "Tier",
-                "ai_decision":     "AI Decision",
-                "ai_confidence":   "AI Conf %",
-                "human_decision":  "Human Decision",
-                "human_reviewer":  "Reviewer",
-                "reviewed_at":     "Reviewed At",
-                "notes":           "Notes",
-            }),
-            use_container_width=True,
-            height=280,
-        )
-
-    st.divider()
-
-    # ── PDF Download ──────────────────────────────────────────────────────────
-    st.subheader("📥 Download PDF Audit Report")
-
-    if raw_drift.empty and raw_auto.empty:
-        st.warning(
-            "No data to export. Adjust your filters or wait for alerts to be resolved."
-        )
-    else:
-        if st.button("Generate & Download PDF", type="primary", key="gen_pdf_btn"):
-            with st.spinner("Building PDF report..."):
-                try:
-                    pdf_bytes = generate_audit_pdf(
-                        drift_df       = raw_drift,
-                        autonomy_df    = raw_auto,
-                        junction_filter= audit_junc,
-                        tier_filter    = audit_tiers,
-                        date_from      = audit_date_from,
-                        date_to        = audit_date_to,
-                        generated_by   = generated_by,
-                    )
-                    fname = (
-                        f"sentinel_audit_"
-                        f"{audit_junc.replace(' ','_')}_"
-                        f"{audit_date_from}_to_{audit_date_to}.pdf"
-                    )
-                    st.download_button(
-                        label        = "⬇ Click here to save the PDF",
-                        data         = pdf_bytes,
-                        file_name    = fname,
-                        mime         = "application/pdf",
-                        key          = "pdf_download_btn",
-                    )
-                    st.success(
-                        f"PDF generated successfully! "
-                        f"{len(raw_drift)} drift events + "
-                        f"{len(raw_auto)} autonomy decisions included."
-                    )
-                except Exception as e:
-                    st.error(f"PDF generation failed: {e}")
+    

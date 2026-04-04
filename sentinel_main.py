@@ -54,21 +54,33 @@ def run():
                 if combo:
                     print(f"    COMBINATION ALERT: {len(active_drifts)} params "
                           f"→ escalated Tier {combo['escalated_tier']}")
-
+            seen = set()
             for event in active_drifts:
-                record_memory(client, event, "onset")
-                record_peak(client, junction_id, event["parameter"], event)
-                handle_autonomy(client, event, combo)
 
-                tier_str = {1: "T1·AI", 2: "T2·REVIEW", 3: "T3·SOS"}.get(
-                    event["tier"], "?"
-                )
-                print(
-                    f"    [{tier_str}] {event.get('parameter'):<24} "
-                    f"z={event.get('z_score'):+.2f}  "
-                    f"conf={event.get('confidence'):.0f}%  "
-                    f"| {str(event.get('reason',''))[:55]}"
-                )
+              key = (junction_id, event["parameter"])
+
+              # 🚫 skip duplicate drift in same cycle
+              if key in seen:
+                  continue
+              seen.add(key)
+              # ⏱️ cooldown check (prevent spam across ticks)
+              recent = client.table("drift_events") \
+                .select("detected_at") \
+                .eq("junction_id", junction_id) \
+                .eq("parameter", event["parameter"]) \
+                .order("detected_at", desc=True) \
+                .limit(1) \
+                .execute()
+
+              if recent.data:
+                from datetime import datetime, timezone
+                last_time = datetime.fromisoformat(recent.data[0]["detected_at"])
+                now = datetime.now(timezone.utc)
+
+                # skip if last alert < 30 sec ago
+              if (now - last_time).total_seconds() < 30:
+                 continue
+                
 
             # Step 5: Check for resolved drifts (tier dropped back to 0)
             for param in PARAMETER_NAMES:

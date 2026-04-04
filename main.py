@@ -1,34 +1,49 @@
 import time
-from db import get_db_client
-from simulator import generate_tick, log_tick
-from engine import compute_decision
+from engine import process_junction
+from db import client
+from drift_detector import detect_drifts
+
+junctions = ["J1", "J2", "J3"]
 
 def run():
-    client = get_db_client()
-    print("Starting Traffic AI Simulator...")
-    
+    print("🚀 Starting Sentinel-AI daemon...")
+
     while True:
         try:
-            tick_data = generate_tick()
-            logged_records = log_tick(client, tick_data)
-            
-            decisions = []
-            for record in logged_records:
-                decision = compute_decision(record, client)
-                decisions.append(decision)
-                
-            client.table("decisions").insert(decisions).execute()
-            
-            for d in decisions:
-                z_str = f"{d['z_score']:.2f}"
-                print(f"[{d['timestamp']}] {d['junction_id']} | Traffic: {d['original_traffic']:>3} | Z: {z_str:>5} | Lanes: {d['lanes_allocated']} | {d['reason']}")
-                
+            for j in junctions:
+                print(f"\n🔄 Processing {j}...")
+
+                results = process_junction(j)
+
+                # ❌ No data from engine
+                if not results:
+                    print(f"⚠️ {j}: No data received from engine")
+                    continue
+
+                print(f"✅ {j}: {len(results)} parameters computed")
+
+                # ✅ Convert engine output → detector input
+                param_map = {
+                    r["parameter"].lower().replace(" ", "_"): {
+                        "value": r["score"],
+                        "reason": r["reason"]
+                    }
+                    for r in results
+                }
+
+                # ✅ Run drift detection (handles DB insert properly)
+                events = detect_drifts(client, j, param_map)
+
+                if events:
+                    print(f"🚨 {j}: {len(events)} drift events detected")
+                else:
+                    print(f"🟢 {j}: No significant drift")
+
         except Exception as e:
-            print(f"Error in tick log/compute: {e}")
-            
-        time.sleep(2)
+            print(f"❌ Error processing junction: {e}")
+
+        time.sleep(5)
+
 
 if __name__ == "__main__":
     run()
-
-

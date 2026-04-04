@@ -1,7 +1,11 @@
 import streamlit as st
 import pandas as pd
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import plotly.graph_objects as go
-from db import get_db_client
+from backend.database import get_db_client
 import time
 
 st.set_page_config(page_title="Traffic AI Sentinel", layout="wide")
@@ -20,9 +24,7 @@ st.sidebar.header("Controls")
 
 mode = st.sidebar.radio("View Mode", ["Live", "Historical"])
 
-if mode == "Historical":
-    date_range = st.sidebar.date_input("Date Range", [])
-else:
+if mode == "Live":
     refresh_rate = st.sidebar.slider("Live Refresh Rate (seconds)", 2, 10, 5)
 
 junctions = ["J1", "J2", "J3"]
@@ -42,7 +44,7 @@ def fetch_live_decisions(junctions_list):
         res = client.table("decisions")\
             .select("*")\
             .eq("junction_id", j)\
-            .order("timestamp", desc=True)\
+            .order("id", desc=True)\
             .limit(50)\
             .execute()
         data.extend(res.data)
@@ -105,14 +107,14 @@ if mode == "Live":
         st.markdown("### Last 50 Decisions")
         df_live["timestamp"] = pd.to_datetime(df_live["timestamp"])
         st.dataframe(
-            df_live.sort_values("timestamp", ascending=False),
+            df_live.sort_values("id", ascending=False),
             use_container_width=True
         )
 
         # ---------------- GRAPHS ----------------
         st.markdown("### Live Trends")
 
-        df_live = df_live.sort_values("timestamp")
+        df_live = df_live.sort_values("id", ascending=True)
 
         for j in selected_junctions:
             j_df = df_live[df_live["junction_id"] == j]
@@ -171,6 +173,60 @@ if mode == "Live":
 
 # -------------------- HISTORICAL MODE --------------------
 elif mode == "Historical":
+    st.markdown("### Historical Traffic Data")
+    
+    # Render with full width in the main window
+    date_range = st.date_input("Select a Date Range", [])
+    
+    if len(date_range) != 2:
+        st.info("Select a full date range to view historical data.")
+    else:
+        from datetime import timedelta
+        start_date, end_date = date_range
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = (end_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        data = []
+        for j in selected_junctions:
+            try:
+                res = client.table("decisions")\
+                    .select("*")\
+                    .eq("junction_id", j)\
+                    .gte("timestamp", start_str)\
+                    .lt("timestamp", end_str)\
+                    .order("id", desc=True)\
+                    .limit(1000)\
+                    .execute()
+                if hasattr(res, 'data') and res.data:
+                    data.extend(res.data)
+            except Exception as e:
+                pass
+                
+        if not data:
+            st.warning("No historical decisions data found for the selected date range.")
+        else:
+            df_hist = pd.DataFrame(data)
+            df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"])
+            
+            st.markdown(f"### Historical Records ({len(df_hist)} events)")
+            st.dataframe(df_hist.sort_values("id", ascending=False), use_container_width=True)
+            
+            st.markdown("### Historical Trends")
+            df_hist = df_hist.sort_values("id", ascending=True)
 
-    st.info("Select a date range to view historical data.")
-
+            for j in selected_junctions:
+                j_df = df_hist[df_hist["junction_id"] == j]
+                if not j_df.empty:
+                    st.markdown(f"#### {j} Historical Activity")
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=j_df["timestamp"], y=j_df.get("original_traffic", j_df.get("traffic", 0)), name="Traffic", line=dict(color="blue")))
+                    if "z_score" in j_df.columns:
+                        fig.add_trace(go.Scatter(x=j_df["timestamp"], y=j_df["z_score"], name="Z-Score", yaxis="y2", line=dict(color="red")))
+                    
+                    fig.update_layout(
+                        title=f"{j} Traffic Trends",
+                        yaxis=dict(title="Traffic"),
+                        yaxis2=dict(title="Z-Score", overlaying="y", side="right"),
+                        hovermode="x unified"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)

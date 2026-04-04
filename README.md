@@ -33,25 +33,25 @@ Sentinel AI uses an advanced Two-Phase State Machine to monitor real-time enviro
 ## 📂 Repository Structure
 SENTINEL.AI/
 │
-├── traffic-ai/                 # The core Traffic Simulator
-│   ├── main.py                 # Traffic AI Data generation engine
-│   ├── simulator.py            # Simulation logic
-│   ├── dashboard.py            # Local simulator dashboard
-│   ├── schema.sql              # Supabase table structures for raw logs
-│   ├── requirements.txt        # Simulator dependencies
-│   └── .env                    # Local environment variables
+├── traffic-ai/                 
+│   ├── main.py                 
+│   ├── simulator.py            
+│   ├── dashboard.py            
+│   ├── schema.sql              
+│   ├── requirements.txt        
+│   └── .env                    
 │
-├── sentinel-ai/                # The Drift & Monitoring Daemon
-│   ├── sentinel_main.py        # Central monitoring daemon
-│   ├── sentinel_dashboard.py   # Primary Unified Streamlit Dashboard
-│   ├── drift_detector.py       # Z-score and statistical drift calculations
-│   ├── baseline_engine.py      # Baseline metric computation
-│   ├── engine.py               # Aggregation & routing
-│   ├── schema.sql              # Supabase table structures for drift insights
-│   ├── requirements.txt        # Sentinel dependencies
-│   └── (other engine files)    # Specialized alert and logic routing
+├── sentinel-ai/                
+│   ├── sentinel_main.py        
+│   ├── sentinel_dashboard.py   
+│   ├── drift_detector.py       
+│   ├── baseline_engine.py      
+│   ├── engine.py               
+│   ├── schema.sql              
+│   ├── requirements.txt        
+│   └── (other engine files)    
 │
-└── README.md                   # Project documentation
+└── README.md                  
 ---
 
 ## 🛠 Getting Started

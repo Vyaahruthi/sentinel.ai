@@ -4,7 +4,7 @@ For each parameter: store observation, compute Z-score, assign tier, store drift
 from datetime import datetime, timezone
 from baseline_engine import get_latest_baseline, compute_z_score, compute_confidence
 
-TIER_THRESHOLDS = {1: 1.5, 2: 2.5, 3: 3.5}
+TIER_THRESHOLDS = {1: 2.0, 2: 2.5, 3: 3.0}
 
 PARAMETER_LABELS = {
     "behaviour_adaptation":  "Behaviour Adaptation",
